@@ -13,22 +13,34 @@ caught when the schedule is built, not as a data race at run time.
 
 ## Status
 
-**M1 — entities and component storage.** A `World` of generational `Entity` ids and components in
-archetype tables (`spawn`, `despawn`, `insert`, `remove`, `get`, `get_mut`); queries and systems
-come next. See the [roadmap](docs/roadmap.md) and the [architecture](docs/architecture.md).
+**M2 — queries.** A `World` of generational `Entity` ids and components in archetype tables
+(`spawn`, `despawn`, `insert`, `remove`, `get`, `get_mut`), and typed queries over it with
+declared access, sequential or parallel on the pragma.core thread pool; systems come next. See
+the [roadmap](docs/roadmap.md) and the [architecture](docs/architecture.md).
 
 ```rust
-use pragma_ecs::World;
+use pragma_core::prelude::{Grain, PoolConfig, ThreadPool};
+use pragma_ecs::{Query, Without, World};
 
 struct Position(f32, f32);
+struct Velocity(f32, f32);
+struct Frozen;
 
 let mut world = World::new();
 let entity = world.spawn()?;
 world.insert(entity, Position(0.0, 0.0))?;
-if let Some(position) = world.get_mut::<Position>(entity) {
-    position.0 += 1.0;
+world.insert(entity, Velocity(1.0, 0.5))?;
+
+// `(&Position, &mut Position)` would be rejected here: the access is checked.
+let mut movement = Query::<(&mut Position, &Velocity), Without<Frozen>>::new()?;
+for (position, velocity) in movement.iter_mut(&mut world)? {
+    position.0 += velocity.0;
 }
-world.despawn(entity)?;
+
+let pool = ThreadPool::new(PoolConfig::default())?;
+movement.par_for_each_mut(&mut world, &pool, Grain::Auto, |(position, velocity)| {
+    position.1 += velocity.1;
+})?;
 ```
 
 ## Building

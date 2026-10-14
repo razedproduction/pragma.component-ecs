@@ -10,7 +10,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 |---|---|---|---|
 | M0 | 0.0.1 | Repository foundation | ✅ |
 | M1 | 0.1.0 | Entities and component storage | ✅ |
-| M2 | 0.2.0 | Queries | 📋 |
+| M2 | 0.2.0 | Queries | 🚧 |
 | M3 | 0.3.0 | Systems on the pragma.core frame graph, vertical slice | 📋 |
 | M4 | 0.4.0 | Commands, events, change detection | 📋 |
 | M5 | 0.5.0 | Hardening: determinism, fuzz, benches, semver | 📋 |
@@ -36,12 +36,17 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] Bounded allocations: growth via `try_reserve` → `EcsError::OutOfMemory` (`tests/oom.rs`, DECISIONS #11)
 - [x] Property tests against a naive `HashMap<Entity, components>` oracle (`tests/oracle.rs`)
 
-## M2 — Queries (0.2.0)
+## M2 — Queries (0.2.0) 🚧
 
-- [ ] Typed queries over `&T` / `&mut T` / `Option<&T>`, filters `With` / `Without`
-- [ ] Declared access (read/write per component type), aliasing rejected at construction
-- [ ] Parallel iteration via `pragma_core` `parallel_for`
-- [ ] Iteration benchmark (`criterion`)
+- [x] **Decisions:** `Query<Q, F>` with an archetype cache (DECISIONS #12), column borrows without
+  `unsafe` (#13), declared access (#14), chunks of rows for parallel iteration (#15), `criterion` (#16)
+- [x] Typed queries over `&T` / `&mut T` / `Option<&T>` (and `Entity`), filters `With` / `Without`
+- [x] Declared access (read/write per component type), aliasing rejected at construction
+  (`EcsError::ConflictingAccess`)
+- [x] Parallel iteration via `pragma_core` `parallel_for`, identical to sequential on 1 and N workers
+  (`tests/parallel.rs`)
+- [x] Iteration benchmark (`criterion`, `benches/query.rs`)
+- [x] Property tests of queries against the oracle (`tests/oracle.rs`)
 
 ## M3 — Systems and the vertical slice (0.3.0)
 

@@ -8,7 +8,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use pragma_ecs::{EcsError, World};
+use pragma_ecs::{EcsError, Query, World};
 
 /// The system allocator, refusing every allocation on a thread that has `FAIL` raised.
 struct Failing;
@@ -107,6 +107,34 @@ fn insert_and_remove_without_memory_leave_the_entity_intact() {
     assert_eq!(world.remove::<A>(e).unwrap(), Some(A(1)));
     world.insert(e, A(4)).unwrap();
     assert_eq!(without_memory(|| world.remove::<A>(e)).unwrap(), Some(A(4)));
+}
+
+#[test]
+fn queries_without_memory_fail_typed_and_a_warm_cache_does_not_allocate() {
+    let mut world = World::new();
+    let e = world.spawn().unwrap();
+    world.insert(e, A(1)).unwrap();
+    world.insert(e, B(2)).unwrap();
+
+    // The access list and the cache of matching tables are allocated with `try_reserve`.
+    assert!(matches!(
+        without_memory(Query::<(&mut A, &B)>::new),
+        Err(EcsError::OutOfMemory { .. })
+    ));
+    let mut query = Query::<(&mut A, &B)>::new().unwrap();
+    assert!(matches!(
+        without_memory(|| query.iter_mut(&mut world).map(|_| ())),
+        Err(EcsError::OutOfMemory { .. })
+    ));
+
+    // Once the cache knows every table, iterating does not allocate.
+    assert_eq!(query.iter_mut(&mut world).unwrap().count(), 1);
+    without_memory(|| {
+        for (a, b) in query.iter_mut(&mut world).unwrap() {
+            a.0 += u32::try_from(b.0).unwrap();
+        }
+    });
+    assert_eq!(world.get::<A>(e), Some(&A(3)));
 }
 
 #[test]
