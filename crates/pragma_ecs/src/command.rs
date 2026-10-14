@@ -376,7 +376,22 @@ impl fmt::Debug for Commands<'_> {
 
 impl Commands<'_> {
     /// Records the creation of an entity. Its id is allocated when the commands are applied;
-    /// the returned [`EntityCommands`] records further commands on it.
+    /// the returned [`EntityCommands`] records further commands on it. To create it with
+    /// several components, [`spawn_bundle`](Self::spawn_bundle) moves it into its table once.
+    ///
+    /// ```
+    /// use pragma_ecs::{Commands, EcsError};
+    ///
+    /// struct Marker;
+    ///
+    /// fn place(mut commands: Commands) -> Result<(), EcsError> {
+    ///     let mut entity = commands.spawn()?;
+    ///     assert_eq!(entity.id(), None); // known only at the sync point
+    ///     entity.insert(Marker)?;
+    ///     Ok(())
+    /// }
+    /// # let _ = place;
+    /// ```
     ///
     /// # Errors
     ///
@@ -455,7 +470,24 @@ impl Commands<'_> {
         }
     }
 
-    /// Records despawning `entity`.
+    /// Records despawning `entity`. Despawning an entity that is gone by then (also despawned
+    /// by another system's command) does nothing.
+    ///
+    /// ```
+    /// use pragma_ecs::{Commands, EcsError, Entity, View};
+    ///
+    /// struct Lifetime(u32);
+    ///
+    /// fn expire(mut items: View<(Entity, &Lifetime)>, mut commands: Commands) -> Result<(), EcsError> {
+    ///     for (entity, lifetime) in items.iter()? {
+    ///         if lifetime.0 == 0 {
+    ///             commands.despawn(entity)?;
+    ///         }
+    ///     }
+    ///     Ok(())
+    /// }
+    /// # let _ = expire;
+    /// ```
     ///
     /// # Errors
     ///
@@ -465,6 +497,26 @@ impl Commands<'_> {
     }
 
     /// Records inserting `value` into `entity` (or replacing its component of that type).
+    ///
+    /// ```
+    /// use pragma_ecs::{Commands, EcsError, Entity, View, Without};
+    ///
+    /// struct Health(u32);
+    /// struct Wounded;
+    ///
+    /// fn triage(
+    ///     mut bodies: View<(Entity, &Health), Without<Wounded>>,
+    ///     mut commands: Commands,
+    /// ) -> Result<(), EcsError> {
+    ///     for (entity, health) in bodies.iter()? {
+    ///         if health.0 < 50 {
+    ///             commands.insert(entity, Wounded)?;
+    ///         }
+    ///     }
+    ///     Ok(())
+    /// }
+    /// # let _ = triage;
+    /// ```
     ///
     /// # Errors
     ///
@@ -500,7 +552,23 @@ impl Commands<'_> {
         self.queue.insert_bundle(Target::Existing(entity), bundle)
     }
 
-    /// Records removing the component of type `T` from `entity`.
+    /// Records removing the component of type `T` from `entity`; nothing happens if it has none.
+    ///
+    /// ```
+    /// use pragma_ecs::{Commands, EcsError, Entity, View};
+    ///
+    /// struct Stunned(u32);
+    ///
+    /// fn recover(mut stunned: View<(Entity, &Stunned)>, mut commands: Commands) -> Result<(), EcsError> {
+    ///     for (entity, stun) in stunned.iter()? {
+    ///         if stun.0 == 0 {
+    ///             commands.remove::<Stunned>(entity)?;
+    ///         }
+    ///     }
+    ///     Ok(())
+    /// }
+    /// # let _ = recover;
+    /// ```
     ///
     /// # Errors
     ///
@@ -610,7 +678,26 @@ impl EntityCommands<'_> {
         Ok(self)
     }
 
-    /// Records despawning the entity.
+    /// Records despawning the entity; ends the chain. A spawned entity that is despawned in the
+    /// same queue is created and destroyed at the sync point, its id freed again.
+    ///
+    /// ```
+    /// use pragma_ecs::{Commands, EcsError, Entity, View, With};
+    ///
+    /// struct Ghost;
+    /// struct Haunting(u32);
+    ///
+    /// fn exorcise(mut ghosts: View<Entity, With<Ghost>>, mut commands: Commands) -> Result<(), EcsError> {
+    ///     for entity in ghosts.iter()? {
+    ///         commands.entity(entity).despawn()?;
+    ///     }
+    ///     // Created and destroyed at the sync point: the entity never shows up in a query.
+    ///     let mut probe = commands.spawn()?;
+    ///     probe.insert(Haunting(0))?.remove::<Haunting>()?;
+    ///     probe.despawn()
+    /// }
+    /// # let _ = exorcise;
+    /// ```
     ///
     /// # Errors
     ///
