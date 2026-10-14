@@ -1,0 +1,45 @@
+# Fuzz targets of pragma.component-ecs (cargo-fuzz, nightly). A separate workspace: libFuzzer is
+# built from C++ (`libfuzzer-sys`), so it is part of neither users' dependency trees nor the
+# workspace audit and `cargo deny` (DECISIONS.md #30, as pragma.core #20).
+#
+#   cargo +nightly fuzz run world_ops
+#   cargo +nightly fuzz run commands
+#   cargo +nightly fuzz run change_ticks
+
+[package]
+name = "pragma_ecs_fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+pragma_ecs = { path = "../crates/pragma_ecs" }
+pragma_core = { version = "1.0.0", default-features = false, features = ["jobs", "graph"] }
+
+[[bin]]
+name = "world_ops"
+path = "fuzz_targets/world_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commands"
+path = "fuzz_targets/commands.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "change_ticks"
+path = "fuzz_targets/change_ticks.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
