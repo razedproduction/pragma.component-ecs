@@ -1,0 +1,34 @@
+# Baseline benchmarks: pragma_ecs next to hecs and bevy_ecs on the same workloads
+# (DECISIONS.md #31). A separate workspace: bevy_ecs needs a newer Rust than our MSRV and pulls
+# many crates, none of which may reach the main lock file, its MSRV check, `cargo deny` or the
+# audit. Dev only, never published.
+#
+#   cargo bench --manifest-path baseline/Cargo.toml
+
+[package]
+name = "pragma_ecs_baseline"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+pragma_ecs = { path = "../crates/pragma_ecs" }
+hecs = { version = "0.11.2", default-features = false, features = ["std"] }
+bevy_ecs = { version = "0.20.0", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "baseline"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = true
+
+[workspace]
+members = ["."]
