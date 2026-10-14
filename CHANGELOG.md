@@ -14,8 +14,9 @@ since 0.1.0. Tagging and publishing are done by the owner.
   `World::insert_bundle` (one table move; components of the same types are replaced),
   `Commands::spawn_bundle` (returns `EntityCommands`), `Commands::insert_bundle` and
   `EntityCommands::insert_bundle`; the new error `EcsError::DuplicateComponent` for a bundle
-  with a type twice. Spawning 10 000 entities with two components: about 1.5 ms instead of
-  2.4 ms with `spawn` + `insert` (`baseline/`).
+  with a type twice. Spawning 10 000 entities with two components: about 1.0 ms instead of
+  1.85 ms with `spawn` + `insert`s (2.46 ms in M5; `bevy_ecs` 0.96 ms, `hecs` 0.55 ms,
+  `baseline/`).
 - `pub use pragma_core`: the `pragma_core` the crate is built with (#36).
 - Crate documentation (#36, #38): an overview, the semver guarantees (items hidden from the
   documentation and the hidden methods of sealed traits are not covered) and an "Integrating

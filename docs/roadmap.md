@@ -107,7 +107,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
   with a compiled engine skeleton); `cargo semver-checks` confirms 1.0.0 only adds to 0.5.0
 - [x] Bundle spawns into the final table, for `World` and `Commands` (`spawn_bundle`,
   `insert_bundle`; DECISIONS #34: spawning was the largest gap to `hecs` / `bevy_ecs` in the
-  M5 baseline — 2.46 ms → about 1.5 ms, `docs/architecture.md` §6), tested against the
+  M5 baseline — 2.46 ms → about 1.0 ms, level with `bevy_ecs`, `docs/architecture.md` §6), tested against the
   oracles, fuzzed, benchmarked; `ecs_sim` spawns through bundles with unchanged golden hashes
 - [x] crates.io metadata: version 1.0.0, `publish` enabled, the crate's own README and LICENSE,
   `cargo package -p pragma_ecs` verified
