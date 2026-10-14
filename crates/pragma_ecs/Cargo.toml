@@ -25,5 +25,9 @@ criterion = { workspace = true }
 name = "query"
 harness = false
 
+[[bench]]
+name = "schedule"
+harness = false
+
 [lints]
 workspace = true

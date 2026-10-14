@@ -10,9 +10,12 @@ use std::any::{Any, TypeId, type_name};
 use std::fmt;
 use std::iter::Copied;
 use std::marker::PhantomData;
-use std::slice;
+use std::{mem, slice};
+
+use pragma_core::graph::{self, TaskContext};
 
 use crate::access::{Access, AccessKind};
+use crate::lend::Columns;
 use crate::{Component, EcsError, Entity};
 
 mod sealed {
@@ -129,6 +132,48 @@ pub trait QueryData: Sealed {
     /// Iterates the rows.
     #[doc(hidden)]
     fn iter<'w>(slice: Self::Slice<'w>) -> Self::Iter<'w>;
+
+    /// The borrows of the lent columns a system holds during a frame (DECISIONS #18).
+    #[doc(hidden)]
+    type Guard<'w>;
+
+    /// Walks the lent columns table by table, in ascending table order.
+    #[doc(hidden)]
+    type Cursor<'a>;
+
+    /// Borrows the element's lent columns from the frame graph.
+    #[doc(hidden)]
+    fn acquire<'w>(ctx: &TaskContext<'w>) -> Result<Self::Guard<'w>, EcsError>;
+
+    /// Starts walking the borrowed columns.
+    #[doc(hidden)]
+    fn cursor<'a>(guard: &'a mut Self::Guard<'_>) -> Self::Cursor<'a>;
+
+    /// The rows of table `id` (ids ascending between calls), whose row entities are `entities`;
+    /// `None` if a needed column is missing.
+    #[doc(hidden)]
+    fn lent<'a>(
+        cursor: &mut Self::Cursor<'a>,
+        id: usize,
+        entities: &'a [Entity],
+    ) -> Option<Self::Slice<'a>>;
+}
+
+/// The slot of table `id` in lent columns, if it holds the table's rows.
+fn lent_shared<T>(columns: &[Vec<T>], id: usize, rows: usize) -> Option<&[T]> {
+    columns
+        .get(id)
+        .map(Vec::as_slice)
+        .filter(|column| column.len() == rows)
+}
+
+/// Walks lent columns for writing: the slots are split off one table at a time.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MutCursor<'a, T> {
+    rest: &'a mut [Vec<T>],
+    /// The table id of `rest[0]`.
+    offset: usize,
 }
 
 /// A [`QueryData`] that only reads, so it can run on a shared `&World`
@@ -192,7 +237,7 @@ impl<T: Component> QueryData for &T {
     type Iter<'w> = slice::Iter<'w, T>;
 
     fn declare(access: &mut Access) -> Result<(), EcsError> {
-        access.add(TypeId::of::<T>(), type_name::<T>(), AccessKind::Read)
+        access.add_component::<T>(AccessKind::Read)
     }
 
     fn matches(types: &[TypeId]) -> bool {
@@ -217,6 +262,25 @@ impl<T: Component> QueryData for &T {
     fn iter<'w>(slice: Self::Slice<'w>) -> Self::Iter<'w> {
         slice.iter()
     }
+
+    type Guard<'w> = graph::Res<'w, Columns<T>>;
+    type Cursor<'a> = &'a [Vec<T>];
+
+    fn acquire<'w>(ctx: &TaskContext<'w>) -> Result<Self::Guard<'w>, EcsError> {
+        ctx.read::<Columns<T>>().map_err(EcsError::graph)
+    }
+
+    fn cursor<'a>(guard: &'a mut Self::Guard<'_>) -> Self::Cursor<'a> {
+        guard.tables()
+    }
+
+    fn lent<'a>(
+        cursor: &mut Self::Cursor<'a>,
+        id: usize,
+        entities: &'a [Entity],
+    ) -> Option<Self::Slice<'a>> {
+        lent_shared(cursor, id, entities.len())
+    }
 }
 
 impl<T: Component> ReadOnlyQueryData for &T {}
@@ -230,7 +294,7 @@ impl<T: Component> QueryData for &mut T {
     type Iter<'w> = slice::IterMut<'w, T>;
 
     fn declare(access: &mut Access) -> Result<(), EcsError> {
-        access.add(TypeId::of::<T>(), type_name::<T>(), AccessKind::Write)
+        access.add_component::<T>(AccessKind::Write)
     }
 
     fn matches(types: &[TypeId]) -> bool {
@@ -255,6 +319,34 @@ impl<T: Component> QueryData for &mut T {
 
     fn iter<'w>(slice: Self::Slice<'w>) -> Self::Iter<'w> {
         slice.iter_mut()
+    }
+
+    type Guard<'w> = graph::ResMut<'w, Columns<T>>;
+    type Cursor<'a> = MutCursor<'a, T>;
+
+    fn acquire<'w>(ctx: &TaskContext<'w>) -> Result<Self::Guard<'w>, EcsError> {
+        ctx.write::<Columns<T>>().map_err(EcsError::graph)
+    }
+
+    fn cursor<'a>(guard: &'a mut Self::Guard<'_>) -> Self::Cursor<'a> {
+        MutCursor {
+            rest: guard.tables_mut(),
+            offset: 0,
+        }
+    }
+
+    fn lent<'a>(
+        cursor: &mut Self::Cursor<'a>,
+        id: usize,
+        entities: &'a [Entity],
+    ) -> Option<Self::Slice<'a>> {
+        let rest = mem::take(&mut cursor.rest);
+        let skip = id.checked_sub(cursor.offset)?.min(rest.len());
+        let (column, rest) = rest.split_at_mut(skip).1.split_first_mut()?;
+        cursor.rest = rest;
+        cursor.offset = id.saturating_add(1);
+        let column = column.as_mut_slice();
+        (column.len() == entities.len()).then_some(column)
     }
 }
 
@@ -296,7 +388,7 @@ impl<T: Component> QueryData for Option<&T> {
     type Iter<'w> = OptionIter<'w, T>;
 
     fn declare(access: &mut Access) -> Result<(), EcsError> {
-        access.add(TypeId::of::<T>(), type_name::<T>(), AccessKind::Read)
+        access.add_component::<T>(AccessKind::Read)
     }
 
     fn matches(_: &[TypeId]) -> bool {
@@ -343,6 +435,29 @@ impl<T: Component> QueryData for Option<&T> {
             remaining: slice.len,
         }
     }
+
+    type Guard<'w> = graph::Res<'w, Columns<T>>;
+    type Cursor<'a> = &'a [Vec<T>];
+
+    fn acquire<'w>(ctx: &TaskContext<'w>) -> Result<Self::Guard<'w>, EcsError> {
+        <&T>::acquire(ctx)
+    }
+
+    fn cursor<'a>(guard: &'a mut Self::Guard<'_>) -> Self::Cursor<'a> {
+        guard.tables()
+    }
+
+    fn lent<'a>(
+        cursor: &mut Self::Cursor<'a>,
+        id: usize,
+        entities: &'a [Entity],
+    ) -> Option<Self::Slice<'a>> {
+        // A table without `T` has an empty slot; with rows, its length tells them apart.
+        Some(OptionSlice {
+            values: lent_shared(cursor, id, entities.len()),
+            len: entities.len(),
+        })
+    }
 }
 
 impl<T: Component> ReadOnlyQueryData for Option<&T> {}
@@ -375,6 +490,23 @@ impl QueryData for Entity {
 
     fn iter<'w>(slice: Self::Slice<'w>) -> Self::Iter<'w> {
         slice.iter().copied()
+    }
+
+    type Guard<'w> = ();
+    type Cursor<'a> = ();
+
+    fn acquire<'w>(_: &TaskContext<'w>) -> Result<Self::Guard<'w>, EcsError> {
+        Ok(())
+    }
+
+    fn cursor<'a>((): &'a mut Self::Guard<'_>) -> Self::Cursor<'a> {}
+
+    fn lent<'a>(
+        (): &mut Self::Cursor<'a>,
+        _: usize,
+        entities: &'a [Entity],
+    ) -> Option<Self::Slice<'a>> {
+        Some(entities)
     }
 }
 
@@ -430,6 +562,25 @@ macro_rules! tuple_query {
 
             fn iter<'w>(slice: Self::Slice<'w>) -> Self::Iter<'w> {
                 TupleIter(($($name::iter(slice.$index),)+))
+            }
+
+            type Guard<'w> = ($($name::Guard<'w>,)+);
+            type Cursor<'a> = ($($name::Cursor<'a>,)+);
+
+            fn acquire<'w>(ctx: &TaskContext<'w>) -> Result<Self::Guard<'w>, EcsError> {
+                Ok(($($name::acquire(ctx)?,)+))
+            }
+
+            fn cursor<'a>(guard: &'a mut Self::Guard<'_>) -> Self::Cursor<'a> {
+                ($($name::cursor(&mut guard.$index),)+)
+            }
+
+            fn lent<'a>(
+                cursor: &mut Self::Cursor<'a>,
+                id: usize,
+                entities: &'a [Entity],
+            ) -> Option<Self::Slice<'a>> {
+                Some(($($name::lent(&mut cursor.$index, id, entities)?,)+))
             }
         }
 

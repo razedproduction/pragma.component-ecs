@@ -78,6 +78,16 @@ impl Archetype {
             .get_mut(row)
     }
 
+    /// The whole column of `T`, to lend it to a frame (DECISIONS #18). Callers must not change
+    /// its length.
+    pub(crate) fn column_mut<T: Component>(&mut self) -> Option<&mut Vec<T>> {
+        let column = self.types.binary_search(&TypeId::of::<T>()).ok()?;
+        self.columns
+            .get_mut(column)?
+            .as_any_mut()
+            .downcast_mut::<Vec<T>>()
+    }
+
     pub(crate) fn add_edge(&self, ty: TypeId) -> Option<usize> {
         self.add_edges.get(&ty).copied()
     }

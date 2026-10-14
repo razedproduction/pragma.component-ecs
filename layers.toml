@@ -9,6 +9,7 @@ unsafe_allowed = []
 
 [crates]
 pragma_ecs = 0   # entities, components, storage, queries, systems on the pragma.core frame graph
+ecs_sim = 1      # vertical-slice example (examples/), DECISIONS.md #22
 
 [allow]
 

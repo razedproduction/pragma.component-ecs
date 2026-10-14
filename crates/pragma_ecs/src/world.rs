@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pragma_core::graph::Resources;
+
 use crate::archetype::{Archetype, two_mut};
 use crate::component::{Column, Component};
 use crate::entity::{Entities, Location};
-use crate::{EcsError, Entity};
+use crate::{EcsError, Entity, Res, Resource};
 
 /// The archetype of entities without components; it is always the first one created.
 const EMPTY: usize = 0;
@@ -16,14 +18,16 @@ const EMPTY: usize = 0;
 /// The id of the next world created. 2^64 worlds will not be created in one process.
 static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
 
-/// A container of entities and their components.
+/// A container of entities, their components and resources.
 ///
 /// Entities with the same set of component types share an archetype table, one column per type
 /// (`docs/architecture.md` §3). Adding or removing a component moves the entity to another table.
+/// Resources are singletons, one value per type ([`insert_resource`](Self::insert_resource)).
+/// A [`Schedule`](crate::Schedule) runs systems over the world.
 ///
-/// Every operation that grows storage reserves memory first (`try_reserve`): running out of
-/// memory is [`EcsError::OutOfMemory`] and leaves the world unchanged. Despawning and lookups
-/// never allocate.
+/// Every operation that grows component storage reserves memory first (`try_reserve`): running
+/// out of memory is [`EcsError::OutOfMemory`] and leaves the world unchanged. Despawning and
+/// lookups never allocate.
 ///
 /// ```
 /// use pragma_ecs::{EcsError, World};
@@ -57,6 +61,8 @@ pub struct World {
     archetypes: Vec<Archetype>,
     /// Archetype lookup by its sorted component type list.
     by_types: HashMap<Vec<TypeId>, usize>,
+    /// The resources, and the slots a schedule lends the columns through (DECISIONS #18, #20).
+    resources: Resources,
 }
 
 impl Default for World {
@@ -83,6 +89,7 @@ impl World {
             entities: Entities::default(),
             archetypes: Vec::new(),
             by_types: HashMap::new(),
+            resources: Resources::new(),
         }
     }
 
@@ -326,9 +333,98 @@ impl World {
             .get_mut::<T>(location.row)
     }
 
+    /// Stores the resource `value`; returns the previous resource of this type, if any.
+    ///
+    /// Allocates one box for the value (fixed size, infallible, DECISIONS #20).
+    ///
+    /// ```
+    /// use pragma_ecs::World;
+    ///
+    /// struct Score(u32);
+    ///
+    /// let mut world = World::new();
+    /// assert!(world.insert_resource(Score(1)).is_none());
+    /// assert_eq!(world.insert_resource(Score(2)).map(|s| s.0), Some(1));
+    /// assert_eq!(world.resource::<Score>().map(|s| s.0), Some(2));
+    /// ```
+    pub fn insert_resource<T: Resource>(&mut self, value: T) -> Option<T> {
+        self.resources.insert(value)
+    }
+
+    /// The resource of type `T`; `None` if the world has none.
+    ///
+    /// ```
+    /// use pragma_ecs::World;
+    ///
+    /// let mut world = World::new();
+    /// assert!(world.resource::<u64>().is_none());
+    /// world.insert_resource(5_u64);
+    /// assert_eq!(world.resource::<u64>().as_deref(), Some(&5));
+    /// ```
+    #[must_use]
+    pub fn resource<T: Resource>(&self) -> Option<Res<'_, T>> {
+        self.resources.get::<T>().map(Res)
+    }
+
+    /// A mutable reference to the resource of type `T`; `None` if the world has none.
+    ///
+    /// ```
+    /// use pragma_ecs::World;
+    ///
+    /// let mut world = World::new();
+    /// world.insert_resource(vec![1, 2]);
+    /// if let Some(list) = world.resource_mut::<Vec<i32>>() {
+    ///     list.push(3);
+    /// }
+    /// assert_eq!(world.resource::<Vec<i32>>().map(|l| l.len()), Some(3));
+    /// ```
+    #[must_use]
+    pub fn resource_mut<T: Resource>(&mut self) -> Option<&mut T> {
+        self.resources.get_mut::<T>()
+    }
+
+    /// Removes the resource of type `T` and returns it.
+    ///
+    /// ```
+    /// use pragma_ecs::World;
+    ///
+    /// let mut world = World::new();
+    /// world.insert_resource('x');
+    /// assert_eq!(world.remove_resource::<char>(), Some('x'));
+    /// assert!(!world.contains_resource::<char>());
+    /// ```
+    pub fn remove_resource<T: Resource>(&mut self) -> Option<T> {
+        self.resources.remove::<T>()
+    }
+
+    /// Whether the world has a resource of type `T`.
+    ///
+    /// ```
+    /// use pragma_ecs::World;
+    ///
+    /// let mut world = World::new();
+    /// world.insert_resource(1.5_f32);
+    /// assert!(world.contains_resource::<f32>());
+    /// assert!(!world.contains_resource::<f64>());
+    /// ```
+    #[must_use]
+    pub fn contains_resource<T: Resource>(&self) -> bool {
+        self.resources.contains::<T>()
+    }
+
     /// The process-unique id of this world.
     pub(crate) const fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The resources, including the slots a schedule lends columns through.
+    pub(crate) fn resources_mut(&mut self) -> &mut Resources {
+        &mut self.resources
+    }
+
+    /// The tables and the resources at once, to lend columns (DECISIONS #18).
+    pub(crate) fn lend_parts(&mut self) -> (&mut [Archetype], &mut Resources) {
+        (&mut self.archetypes, &mut self.resources)
     }
 
     /// The archetype tables, indexed by archetype id. Tables are only ever appended.

@@ -8,7 +8,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use pragma_ecs::{EcsError, Query, World};
+use pragma_core::prelude::{PoolConfig, ThreadPool};
+use pragma_ecs::{EcsError, Query, Schedule, View, World};
 
 /// The system allocator, refusing every allocation on a thread that has `FAIL` raised.
 struct Failing;
@@ -135,6 +136,44 @@ fn queries_without_memory_fail_typed_and_a_warm_cache_does_not_allocate() {
         }
     });
     assert_eq!(world.get::<A>(e), Some(&A(3)));
+}
+
+fn add_b_to_a(mut rows: View<(&mut A, &B)>) -> Result<(), EcsError> {
+    for (a, b) in rows.iter_mut()? {
+        a.0 += u32::try_from(b.0).unwrap();
+    }
+    Ok(())
+}
+
+#[test]
+fn a_frame_without_memory_for_new_tables_lends_nothing() {
+    let pool = ThreadPool::new(PoolConfig::default().with_workers(1)).unwrap();
+    let mut builder = Schedule::builder();
+    builder.add_system("add", add_b_to_a).unwrap();
+    let mut schedule = builder.build().unwrap();
+
+    let mut world = World::new();
+    let e = world.spawn().unwrap();
+    world.insert(e, A(1)).unwrap();
+    world.insert(e, B(2)).unwrap();
+    schedule.run(&mut world, &pool).unwrap();
+    assert_eq!(world.get::<A>(e), Some(&A(3)));
+
+    // A new table: the lending slots must grow before anything is lent.
+    let f = world.spawn().unwrap();
+    world.insert(f, B(5)).unwrap();
+    world.insert(f, A(0)).unwrap();
+    world.insert(f, 0_u8).unwrap();
+    assert!(matches!(
+        without_memory(|| schedule.run(&mut world, &pool)),
+        Err(EcsError::OutOfMemory { .. })
+    ));
+    assert_eq!(world.get::<A>(e), Some(&A(3)));
+    assert_eq!(world.get::<B>(f), Some(&B(5)));
+
+    schedule.run(&mut world, &pool).unwrap();
+    assert_eq!(world.get::<A>(e), Some(&A(5)));
+    assert_eq!(world.get::<A>(f), Some(&A(5)));
 }
 
 #[test]
