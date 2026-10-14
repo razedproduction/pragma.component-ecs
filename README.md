@@ -13,7 +13,7 @@ caught when the schedule is built, not as a data race at run time.
 
 ## Status
 
-**M4 — commands, events, change detection.** A `World` of generational `Entity` ids,
+**M5 — hardening** (on top of M4: commands, events, change detection). A `World` of generational `Entity` ids,
 components in archetype tables and resources; typed queries with declared access, sequential or
 parallel on the pragma.core thread pool; and systems — plain functions of `View`, `Res`,
 `ResMut`, `Commands`, `EventWriter` and `EventReader` parameters — run by a `Schedule` as tasks
@@ -22,9 +22,11 @@ systems without an explicit order are rejected when the schedule is built. Struc
 from systems are deferred commands and events are published at the end of the frame, both in
 a fixed order; `Added<T>` / `Changed<T>` filters see what changed since a query or system last
 ran. [`examples/ecs_sim`](examples/ecs_sim) runs a simulation through all of it and checks that
-the state hash of every tick is the same on 1, 2 and N workers. Hardening (fuzzing, baseline
-benchmarks, semver checks) comes next. See the [roadmap](docs/roadmap.md) and the
-[architecture](docs/architecture.md).
+the state hash of every tick is the same on 1, 2 and N workers; its determinism suite checks
+seven scenarios against committed golden hashes on Windows and Linux in CI. World operations,
+commands and change ticks are fuzzed against naive oracles, a bench gate guards performance,
+and baseline benchmarks compare the crate with `hecs` and `bevy_ecs`. See the
+[roadmap](docs/roadmap.md) and the [architecture](docs/architecture.md).
 
 ```rust
 use pragma_core::prelude::{Grain, PoolConfig, ThreadPool};
@@ -101,6 +103,21 @@ The vertical slice, with its determinism check on several worker counts:
 cargo run --release -p ecs_sim -- --verify 1,2,4
 ```
 
+The determinism suite (every scenario against the golden hashes), the fuzz targets (nightly
+Rust, Linux) and the baseline benchmarks:
+
+```bash
+cargo run --release -p ecs_sim -- --suite
+```
+
+```bash
+cargo +nightly fuzz run world_ops
+```
+
+```bash
+cargo bench --manifest-path baseline/Cargo.toml --bench baseline
+```
+
 The toolchain is pinned in `rust-toolchain.toml` (1.99.0); the minimum supported Rust version is
 1.88, the same as pragma.core. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full check list.
 
@@ -116,6 +133,10 @@ The same rules as pragma.core, checked in CI on every PR:
 - **Bounded allocations.** Storage grows through `try_reserve`; out of memory is
   `EcsError::OutOfMemory` with the world unchanged, not an abort.
 - **Layered.** Crates depend only on lower layers (`layers.toml`).
+- **Deterministic.** The same state hashes on any worker count and both platforms, checked
+  against golden hashes (DECISIONS #29).
+- **Fuzzed, benchmarked, semver-checked.** cargo-fuzz against the property tests' oracles,
+  an A/B bench gate and `cargo semver-checks` on every PR (#30–#33).
 
 ## Platforms
 

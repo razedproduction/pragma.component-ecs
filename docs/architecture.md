@@ -1,8 +1,8 @@
 # Architecture
 
 Status: §2–3 are **implemented** (M1), queries in §4 too (M2), systems, resources and
-schedules (M3), and commands, events and change detection (§4, M4); the rest is the **intended
-design**. Sections marked *open* are decided in the
+schedules (M3), and commands, events and change detection (§4, M4), and the hardening tools of M5
+(§6); the rest is the **intended design**. Sections marked *open* are decided in the
 milestone named there and recorded in `DECISIONS.md`.
 
 ## 1. Place in the stack
@@ -107,7 +107,7 @@ movement.par_for_each_mut(&mut world, &pool, Grain::Auto, |(mut position, veloci
 First numbers (`cargo bench -p pragma_ecs`, 100 000 entities, `(&mut Position, &Velocity)` with
 `[f32; 3]` each, 8 workers on the pragma.core perf machine): a sequential query ≈ 200 µs on one
 table and ≈ 250 µs on 8, a plain `Vec<(Position, Velocity)>` ≈ 257 µs, a parallel query ≈ 170 µs
-(the update is memory-bound). Comparisons with `hecs` / `bevy_ecs` and a bench gate are M5.
+(the update is memory-bound). Comparisons with `hecs` / `bevy_ecs` and the bench gate: §6.
 
 ### Systems and schedules (M3, DECISIONS #17–#21)
 
@@ -256,9 +256,69 @@ costs ≈ 140 µs when nothing changed, ≈ 161 µs when 10 % did and ≈ 217 µ
 ≈ 122 µs without the filter. Spawning 10 000 entities with two components through commands
 ≈ 3.1 ms against ≈ 2.5 ms directly (each command is an ordinary world operation, so a spawn
 moves the entity through `{}` → `{A}` → `{A, B}`); despawning ≈ 377 µs against ≈ 277 µs.
-Batching spawns into their final table is left to M5's benchmarks.
+Batching spawns into their final table: after the M5 baseline (§6), an M6 API item (DECISIONS
+#34).
 
 ## 5. Reliability rules
 
 The same as pragma.core: no `unwrap`/`expect`/`panic!`/unchecked indexing in library code (lints),
 typed `#[non_exhaustive]` errors, pure-Rust dependencies, layers checked by `tools/audit_workspace.py`.
+
+## 6. Hardening (M5, DECISIONS #29–#34)
+
+```
+crates/pragma_ecs/tests/common/   oracles: world (HashMap), commands (direct ops), change (ticks)
+   ├── tests/oracle.rs, commands.rs, change.rs   proptest strategies + decoded random bytes
+   └── fuzz/fuzz_targets/*.rs                     cargo-fuzz, separate workspace (C++ libFuzzer)
+examples/ecs_sim --suite          7 scenarios × {1, 2, N} workers, golden.txt
+baseline/                         pragma_ecs vs hecs vs bevy_ecs, separate workspace
+tools/bench_gate.py               A/B of PR base and head, normalized by a reference
+```
+
+- **Determinism suite.** `ecs_sim --suite` runs seven scenarios (the default 100 000 entities, an
+  odd count, an empty world, one entity, four tables, a lethal hazard that turns most of a
+  frame into commands and events, a calm arena where `Changed<Health>` sees few rows) on 1, 2
+  and N workers and requires the same hash on every tick. Each scenario's *history* (an FNV
+  fold of all its tick hashes) is compared with `examples/ecs_sim/golden.txt`, so a hash that
+  differs between Windows and Linux or an unintended change of behaviour fails; `--bless`
+  rewrites the file. The simulation uses only IEEE-exact `f32` operations (`+ − × ÷`, `sqrt`,
+  `min`/`max`/`clamp`), which is why one golden file holds on every platform. CI: 200 ticks on
+  every PR, 3000 nightly, both platforms; a debug test runs the scenarios capped in size.
+- **Fuzzing.** One oracle per property, in `tests/common/`: each module has the operations, a
+  harness that applies them to the world and to the naive model and panics on the first
+  disagreement, and a decoder from bytes. The property tests generate operations with proptest
+  strategies and also feed random bytes through the decoder; the fuzz targets `world_ops`,
+  `commands`, `change_ticks` include the same module through `#[path]`. libFuzzer does not link
+  on Windows, so the targets run on Linux (60 s per PR, 10 min nightly with the corpus kept in
+  the Actions cache); on Windows the same oracles run through proptest.
+- **Bench gate.** In a PR, the base and the head are built into separate target directories
+  and measured interleaved for three rounds; a criterion measurement fails when it is more than
+  10 % slower **and** still more than 10 % slower after dividing by the shift of its reference
+  in the same bench (a plain `Vec`, sequential queries, direct world operations, a plain read),
+  `ecs_sim` ms/tick when it is slower than 10 % plus its own run-to-run noise.
+  A known fragility found by the first local run: the sequential `for` loop over 8 tables
+  (`query_iter/query_8_tables`) depends on code generation, not on our code — changing only
+  the crate version from 0.1.0 to 0.5.0 (which changes symbol hashes) moved it from ≈ 345 µs to
+  ≈ 480–550 µs on the same machine, reproducibly, while the 1-table, read-only and parallel
+  variants stayed put; `#[inline]` on the iterators' `next` did not help. The gate reports it
+  as a regression on the PR that bumps the version; making that loop robust (internal
+  iteration per table) is a follow-up.
+- **Semver.** `cargo semver-checks -p pragma_ecs` against the PR base: a breaking change needs a
+  version bump (the version is 0.5.0 since M5).
+
+Baseline numbers (`cargo bench --manifest-path baseline/Cargo.toml --bench baseline`, 8 logical
+cores, Windows, release, medians):
+
+| workload | pragma_ecs | hecs 0.11 | bevy_ecs 0.20 |
+|---|---|---|---|
+| spawn 10 000 entities with 2 components | 2.46 ms | 0.59 ms | 1.07 ms |
+| iterate 100 000 `(&mut Position, &Velocity)` (a `Vec`: 258 µs) | 322 µs | 204 µs | 348 µs |
+| iterate 20 rows in each of 26 tables | 1.62 µs | 0.35 µs | 1.04 µs |
+| add and remove a component on 10 000 entities | 3.06 ms | 1.85 ms | 2.59 ms |
+| despawn 10 000 entities | 277 µs | 344 µs | 874 µs |
+
+`pragma_ecs` and `bevy_ecs` stamp a change tick on every write (`u64` and `u32`), `hecs` has
+no change detection; iteration is faster than `bevy_ecs` and pays the tick store against
+`hecs`. Spawning is the gap: without bundles every `insert` moves the entity to the next table
+(`{}` → `{Position}` → `{Position, Velocity}`). DECISIONS #34 keeps the storage and the ticks as
+they are and leaves bundle spawns (for the world and for commands) to the M6 API review.

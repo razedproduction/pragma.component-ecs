@@ -1,0 +1,18 @@
+# Golden history hashes of the ecs_sim determinism suite (DECISIONS #29).
+# Regenerate with `cargo run --release -p ecs_sim -- --suite --ticks N --bless`;
+# a change here means the simulation's behaviour changed: review it.
+# name entities ticks history
+default 100000 200 8c76e8cd51e8f602
+odd-count 33333 200 e1aa1d5aefba776b
+empty-world 0 200 381dc5389c792d8c
+single-entity 1 200 e4bc025993b136bf
+fragmented 20000 200 6b6070cc931903a2
+carnage 20000 200 994b977015201bbd
+calm 20000 200 d09405579d66ce5b
+default 100000 3000 e0f7f355f67f8912
+odd-count 33333 3000 66f3de476a2c288b
+empty-world 0 3000 01e6bc7bc39853cf
+single-entity 1 3000 7d34a1c4cf63c756
+fragmented 20000 3000 b3282e4e474be60c
+carnage 20000 3000 4176a48497c9d109
+calm 20000 3000 72a0ee17d736a9f8

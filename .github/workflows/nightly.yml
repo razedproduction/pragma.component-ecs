@@ -1,0 +1,93 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  determinism:
+    name: Determinism suite, 3000 ticks (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show # installs the toolchain pinned in rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      # Every scenario over many ticks on 1, 2 and N workers against the golden hashes (DECISIONS #29).
+      - run: cargo run -p ecs_sim --release -- --suite --ticks 3000
+
+  fuzz:
+    name: fuzz (${{ matrix.target }}, 10 min)
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [world_ops, commands, change_ticks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # The corpus survives across nights: restore the latest one and save the extended one under a new
+      # key (caches are immutable).
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=600
+        env:
+          RUSTFLAGS: ""
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
+
+  baseline:
+    name: Baseline benches (hecs, bevy_ecs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: baseline
+      # The same workloads on pragma_ecs, hecs and bevy_ecs (DECISIONS #31); the table goes into the
+      # job summary. Shared runners are noisy: compare the libraries within one run, not across nights.
+      - name: baseline
+        shell: bash
+        run: |
+          cargo bench --manifest-path baseline/Cargo.toml --bench baseline -- --warm-up-time 1 --measurement-time 3 --noplot
+          python3 - "$GITHUB_STEP_SUMMARY" <<'EOF'
+          import json, pathlib, sys
+          root = pathlib.Path("baseline/target/criterion")
+          rows = {}
+          for path in sorted(root.glob("*/*/new/estimates.json")):
+              group, lib = path.parts[-4], path.parts[-3]
+              rows.setdefault(group, {})[lib] = json.loads(path.read_text())["median"]["point_estimate"]
+          libs = ["pragma_ecs", "hecs", "bevy_ecs", "vec"]
+          lines = ["### Baseline (median, µs)", "", "| workload | " + " | ".join(libs) + " |",
+                   "|---" * (len(libs) + 1) + "|"]
+          for group, values in rows.items():
+              cells = [f"{values[l] / 1e3:.1f}" if l in values else "—" for l in libs]
+              lines.append(f"| {group} | " + " | ".join(cells) + " |")
+          text = "\n".join(lines) + "\n"
+          print(text)
+          with open(sys.argv[1], "a", encoding="utf-8") as fh:
+              fh.write(text)
+          EOF

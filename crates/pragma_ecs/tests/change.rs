@@ -5,245 +5,35 @@
 //! asks long-lived queries with `Added` / `Changed` filters at random points. A naive oracle
 //! keeps, per entity, the sequence numbers of the operations that added and last changed its
 //! component, and per query the sequence number of its previous call: every answer must match.
-//! A second test runs writers and readers through a schedule in both orders on 1 and 4 workers.
+//! The oracle (`common/change.rs`) is shared with the `change_ticks` fuzz target (DECISIONS
+//! #30). A second test runs writers and readers through a schedule in both orders on 1 and 4
+//! workers.
 // Test code: a panic is a test failure.
 #![allow(
     clippy::unwrap_used,
-    clippy::panic,
     clippy::arithmetic_side_effects,
     clippy::indexing_slicing,
     clippy::needless_pass_by_value
 )]
 
-use std::collections::HashMap;
+mod common;
 
+use common::change::{A, Mover, OBSERVERS, Op, check, decode};
 use pragma_core::prelude::{Grain, PoolConfig, ThreadPool};
-use pragma_ecs::{
-    Added, Changed, EcsError, Entity, Query, ResMut, Schedule, View, With, Without, World,
-};
+use pragma_ecs::{Changed, EcsError, ResMut, Schedule, View, Without, World};
 use proptest::prelude::*;
-use proptest::sample::Index;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct A(u32);
-
-/// A component that only moves rows between tables.
-#[derive(Clone, Copy, Debug)]
-struct Mover;
-
-#[derive(Clone, Debug)]
-enum Op {
-    Spawn,
-    Despawn(Index),
-    Insert(Index, u32),
-    Remove(Index),
-    GetMut(Index),
-    /// Writes `A` through `Mut` where the value is odd; reads the others.
-    WriteOdd,
-    /// Adds or removes `Mover`, moving the row to another table.
-    Move(Index),
-    /// Asks observer `.0` (see `Observers`).
-    Observe(usize),
-}
 
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => Just(Op::Spawn),
-        1 => any::<Index>().prop_map(Op::Despawn),
-        4 => (any::<Index>(), any::<u32>()).prop_map(|(i, v)| Op::Insert(i, v)),
-        1 => any::<Index>().prop_map(Op::Remove),
-        2 => any::<Index>().prop_map(Op::GetMut),
+        1 => any::<usize>().prop_map(Op::Despawn),
+        4 => (any::<usize>(), any::<u32>()).prop_map(|(i, v)| Op::Insert(i, v)),
+        1 => any::<usize>().prop_map(Op::Remove),
+        2 => any::<usize>().prop_map(Op::GetMut),
         1 => Just(Op::WriteOdd),
-        2 => any::<Index>().prop_map(Op::Move),
+        2 => any::<usize>().prop_map(Op::Move),
         4 => (0..OBSERVERS).prop_map(Op::Observe),
     ]
-}
-
-/// The oracle's record of one `A`: its value and the sequence numbers of its addition and
-/// last change.
-#[derive(Clone, Copy, Debug)]
-struct Record {
-    value: u32,
-    added: u64,
-    changed: u64,
-}
-
-const OBSERVERS: usize = 4;
-
-/// The queries under test, each with the oracle's tick of its previous call.
-struct Observers {
-    changed: Query<Entity, Changed<A>>,
-    added: Query<Entity, Added<A>>,
-    /// `Changed<A>` with the data written: writes every row it sees.
-    rewrite: Query<(Entity, &'static mut A), Changed<A>>,
-    /// A row filter together with table filters.
-    moved: Query<Entity, (Changed<A>, With<Mover>)>,
-    last: [u64; OBSERVERS],
-}
-
-struct Harness {
-    world: World,
-    known: Vec<Entity>,
-    alive: HashMap<Entity, Option<Record>>,
-    movers: HashMap<Entity, bool>,
-    seq: u64,
-    observers: Observers,
-    writer: Query<&'static mut A>,
-}
-
-fn sorted(mut v: Vec<Entity>) -> Vec<Entity> {
-    v.sort();
-    v
-}
-
-impl Harness {
-    fn pick(&self, i: &Index) -> Option<Entity> {
-        (!self.known.is_empty()).then(|| *i.get(&self.known))
-    }
-
-    fn apply(&mut self, op: Op) {
-        self.seq += 1;
-        let seq = self.seq;
-        match op {
-            Op::Spawn => {
-                let e = self.world.spawn().unwrap();
-                self.known.push(e);
-                self.alive.insert(e, None);
-                self.movers.insert(e, false);
-            }
-            Op::Despawn(i) => {
-                let Some(e) = self.pick(&i) else { return };
-                let alive = self.alive.remove(&e).is_some();
-                assert_eq!(self.world.despawn(e).is_ok(), alive);
-            }
-            Op::Insert(i, v) => {
-                let Some(e) = self.pick(&i) else { return };
-                let result = self.world.insert(e, A(v));
-                match self.alive.get_mut(&e) {
-                    Some(record) => {
-                        let replaced = result.unwrap();
-                        assert_eq!(replaced.map(|a| a.0), record.map(|r| r.value));
-                        *record = Some(match *record {
-                            Some(r) => Record {
-                                value: v,
-                                changed: seq,
-                                ..r
-                            },
-                            None => Record {
-                                value: v,
-                                added: seq,
-                                changed: seq,
-                            },
-                        });
-                    }
-                    None => assert!(matches!(result, Err(EcsError::NoSuchEntity { .. }))),
-                }
-            }
-            Op::Remove(i) => {
-                let Some(e) = self.pick(&i) else { return };
-                let removed = self.world.remove::<A>(e);
-                match self.alive.get_mut(&e) {
-                    Some(record) => {
-                        assert_eq!(removed.unwrap().map(|a| a.0), record.map(|r| r.value));
-                        *record = None;
-                    }
-                    None => assert!(removed.is_err()),
-                }
-            }
-            Op::GetMut(i) => {
-                let Some(e) = self.pick(&i) else { return };
-                let got = self.world.get_mut::<A>(e).is_some();
-                let record = self.alive.get_mut(&e).and_then(Option::as_mut);
-                assert_eq!(got, record.is_some());
-                if let Some(record) = record {
-                    record.changed = seq;
-                }
-            }
-            Op::WriteOdd => {
-                for mut a in self.writer.iter_mut(&mut self.world).unwrap() {
-                    if a.0 % 2 == 1 {
-                        a.0 = a.0.wrapping_add(2);
-                    }
-                }
-                for record in self.alive.values_mut().flatten() {
-                    if record.value % 2 == 1 {
-                        record.value = record.value.wrapping_add(2);
-                        record.changed = seq;
-                    }
-                }
-            }
-            Op::Move(i) => {
-                let Some(e) = self.pick(&i) else { return };
-                let Some(mover) = self
-                    .movers
-                    .get_mut(&e)
-                    .filter(|_| self.alive.contains_key(&e))
-                else {
-                    return;
-                };
-                if *mover {
-                    self.world.remove::<Mover>(e).unwrap();
-                } else {
-                    self.world.insert(e, Mover).unwrap();
-                }
-                *mover = !*mover;
-            }
-            Op::Observe(k) => self.observe(k, seq),
-        }
-    }
-
-    /// The live entities with an `A` whose record passes `f`, sorted.
-    fn expected(&self, f: impl Fn(&Entity, &Record) -> bool) -> Vec<Entity> {
-        sorted(
-            self.alive
-                .iter()
-                .filter_map(|(e, r)| Some((e, (*r)?)))
-                .filter(|(e, r)| f(e, r))
-                .map(|(e, _)| *e)
-                .collect(),
-        )
-    }
-
-    fn observe(&mut self, k: usize, seq: u64) {
-        let last = self.observers.last[k];
-        let expected = match k {
-            1 => self.expected(|_, r| r.added > last),
-            3 => self.expected(|e, r| r.changed > last && self.movers[e]),
-            _ => self.expected(|_, r| r.changed > last),
-        };
-        let o = &mut self.observers;
-        let actual: Vec<Entity> = match k {
-            0 => o.changed.iter(&self.world).unwrap().collect(),
-            1 => o.added.iter(&self.world).unwrap().collect(),
-            2 => {
-                let mut seen = Vec::new();
-                for (e, mut a) in o.rewrite.iter_mut(&mut self.world).unwrap() {
-                    a.0 = a.0.wrapping_mul(3);
-                    seen.push(e);
-                }
-                for e in &expected {
-                    if let Some(Some(record)) = self.alive.get_mut(e) {
-                        record.value = record.value.wrapping_mul(3);
-                        record.changed = seq;
-                    }
-                }
-                seen
-            }
-            _ => o.moved.iter(&self.world).unwrap().collect(),
-        };
-        assert_eq!(sorted(actual), expected, "observer {k}");
-        self.observers.last[k] = seq;
-    }
-
-    fn check_values(&self) {
-        for (e, record) in &self.alive {
-            assert_eq!(
-                self.world.get::<A>(*e).map(|a| a.0),
-                record.map(|r| r.value)
-            );
-        }
-        assert_eq!(self.world.len(), self.alive.len());
-    }
 }
 
 proptest! {
@@ -253,30 +43,13 @@ proptest! {
     /// the oracle saw added / changed since that query's previous call.
     #[test]
     fn change_filters_match_a_per_entity_oracle(ops in proptest::collection::vec(op(), 0..200)) {
-        let mut h = Harness {
-            world: World::new(),
-            known: Vec::new(),
-            alive: HashMap::new(),
-            movers: HashMap::new(),
-            seq: 0,
-            observers: Observers {
-                changed: Query::new().unwrap(),
-                added: Query::new().unwrap(),
-                rewrite: Query::new().unwrap(),
-                moved: Query::new().unwrap(),
-                last: [0; OBSERVERS],
-            },
-            writer: Query::new().unwrap(),
-        };
-        for op in ops {
-            h.apply(op);
-            h.check_values();
-        }
-        for k in 0..OBSERVERS {
-            h.seq += 1;
-            let seq = h.seq;
-            h.observe(k, seq);
-        }
+        check(ops);
+    }
+
+    /// The fuzz target's decoder: arbitrary bytes are a valid sequence of operations.
+    #[test]
+    fn decoded_bytes_match_the_tick_oracle(data in proptest::collection::vec(any::<u8>(), 0..1024)) {
+        check(decode(&data));
     }
 }
 

@@ -24,6 +24,12 @@
 //! events are applied in system registration order, and change ticks follow the schedule's
 //! topological order.
 //!
+//! The mandatory determinism suite (M5, DECISIONS #29), [`determinism_suite`] and
+//! [`run_suite`], runs scenarios of different sizes, seeds, table layouts and hazards on several
+//! worker counts; `ecs_sim --suite` also checks every scenario's [`history`] hash against the
+//! committed golden file (`golden.txt`, [`parse_golden`], [`check_golden`]), so a hash that
+//! differs between platforms or an unintended behaviour change fails CI.
+//!
 //! ```
 //! use ecs_sim::{SimConfig, run};
 //!
@@ -75,6 +81,12 @@ pub enum SimError {
     /// Invalid configuration.
     #[error("invalid config: {0}")]
     Config(&'static str),
+    /// A malformed line in the golden file of the determinism suite.
+    #[error("golden file: malformed line {line}")]
+    Golden {
+        /// The one-based line number.
+        line: usize,
+    },
 }
 
 /// Run parameters.
@@ -88,6 +100,13 @@ pub struct SimConfig {
     pub workers: usize,
     /// Seed of the initial state.
     pub seed: u64,
+    /// The hazard's damage in percent of the normal one: 0 is a calm arena where health only
+    /// regenerates, large values kill many entities every tick (a frame heavy with commands
+    /// and events).
+    pub lethality: u16,
+    /// The number of tables (1..=4) the initial entities are spread over, round-robin, by
+    /// marker components.
+    pub fragments: usize,
 }
 
 impl Default for SimConfig {
@@ -97,6 +116,8 @@ impl Default for SimConfig {
             ticks: 300,
             workers: default_workers(),
             seed: 0x5EED_CAFE,
+            lethality: 100,
+            fragments: 1,
         }
     }
 }
@@ -152,6 +173,15 @@ pub struct Age(pub u32);
 /// A marker: the entity died and will be replaced in the next tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dead;
+
+/// Markers that spread the initial entities over several tables (`SimConfig::fragments`).
+struct Shard1;
+struct Shard2;
+struct Shard3;
+
+/// The hazard's damage per second (a resource).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hazard(pub f32);
 
 /// An event: `entity` died at tick `tick`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,11 +271,15 @@ fn movement(mut bodies: View<(&mut Position, &Velocity), Without<Dead>>) -> Resu
 
 /// Damages living entities inside the hazard, heals the others. Writes only a health that
 /// really changes, so that `Changed<Health>` means something (DECISIONS #28).
-fn hazard(mut bodies: View<(&Position, &mut Health), Without<Dead>>) -> Result<(), EcsError> {
+fn hazard(
+    mut bodies: View<(&Position, &mut Health), Without<Dead>>,
+    hazard: Res<Hazard>,
+) -> Result<(), EcsError> {
+    let dps = hazard.0;
     bodies.par_for_each_mut(Grain::Auto, |(position, mut health)| {
         let (dx, dy) = (position.x - CENTER, position.y - CENTER);
         let change = if dx * dx + dy * dy < HAZARD_RADIUS * HAZARD_RADIUS {
-            -HAZARD_DPS
+            -dps
         } else {
             REGEN
         };
@@ -404,7 +438,7 @@ pub fn schedule() -> Result<Schedule, EcsError> {
 pub fn populate(config: &SimConfig) -> Result<World, EcsError> {
     let mut rng = Rng(config.seed);
     let mut world = World::new();
-    for _ in 0..config.entities {
+    for i in 0..config.entities {
         let entity = world.spawn()?;
         world.insert(
             entity,
@@ -422,7 +456,15 @@ pub fn populate(config: &SimConfig) -> Result<World, EcsError> {
         )?;
         world.insert(entity, Health(MAX_HEALTH * (0.2 + 0.8 * rng.unit())))?;
         world.insert(entity, Age(0))?;
+        // A new entity has no marker yet: nothing is replaced.
+        let _ = match i.checked_rem(config.fragments) {
+            Some(1) => world.insert(entity, Shard1)?.map(|_| ()),
+            Some(2) => world.insert(entity, Shard2)?.map(|_| ()),
+            Some(3) => world.insert(entity, Shard3)?.map(|_| ()),
+            _ => None,
+        };
     }
+    world.insert_resource(Hazard(HAZARD_DPS * f32::from(config.lethality) / 100.0));
     world.insert_resource(Tick(0));
     world.insert_resource(StateHash(0));
     world.insert_resource(Deaths(0));
@@ -435,14 +477,17 @@ pub fn populate(config: &SimConfig) -> Result<World, EcsError> {
 ///
 /// # Errors
 ///
-/// [`SimError::Config`] for zero ticks or workers, [`SimError::Pool`] if the pool cannot be
-/// created, [`SimError::Ecs`] if a frame fails.
+/// [`SimError::Config`] for zero ticks or workers or fragments outside `1..=4`,
+/// [`SimError::Pool`] if the pool cannot be created, [`SimError::Ecs`] if a frame fails.
 pub fn run(config: &SimConfig) -> Result<SimReport, SimError> {
     if config.ticks == 0 {
         return Err(SimError::Config("ticks must be positive"));
     }
     if config.workers == 0 {
         return Err(SimError::Config("workers must be positive"));
+    }
+    if !(1..=4).contains(&config.fragments) {
+        return Err(SimError::Config("fragments must be in 1..=4"));
     }
     let pool = ThreadPool::new(PoolConfig::default().with_workers(config.workers))?;
     let mut schedule = schedule()?;
@@ -501,11 +546,7 @@ pub fn compare(config: &SimConfig, workers: &[usize]) -> Result<Verdict, SimErro
         match &reference {
             None => reference = Some(report.hashes),
             Some(expected) => {
-                if let Some(tick) = expected
-                    .iter()
-                    .zip(&report.hashes)
-                    .position(|(a, b)| a != b)
-                {
+                if let Some(tick) = first_difference(expected, &report.hashes) {
                     return Ok(Verdict::Differs {
                         workers: count,
                         tick,
@@ -515,4 +556,251 @@ pub fn compare(config: &SimConfig, workers: &[usize]) -> Result<Verdict, SimErro
         }
     }
     Ok(Verdict::Same)
+}
+
+/// The first tick at which two hash sequences differ (a length difference counts too).
+fn first_difference(a: &[u64], b: &[u64]) -> Option<usize> {
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x != y)
+        .or_else(|| (a.len() != b.len()).then(|| a.len().min(b.len())))
+}
+
+/// One hash of a whole run: an FNV-1a fold of the hashes of all its ticks.
+#[must_use]
+pub fn history(hashes: &[u64]) -> u64 {
+    hashes.iter().fold(FNV_OFFSET, |h, &tick| fnv(h, tick))
+}
+
+/// A scenario of the determinism suite (DECISIONS #29).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scenario {
+    /// The scenario name, its key in the golden file.
+    pub name: &'static str,
+    /// The run configuration; `workers` is replaced by each worker count of the suite.
+    pub config: SimConfig,
+}
+
+/// The mandatory determinism suite (milestone M5, DECISIONS #29).
+///
+/// Scenarios differ in seed, number of entities (the default 100 000, an odd count, an empty
+/// world, a single entity), the number of tables the entities start in, and the hazard: a
+/// lethal one kills many entities every tick, so most of the frame is commands and events, a
+/// calm one leaves health alone once it regenerated, so change filters see few changes. Every
+/// scenario runs `ticks` ticks; its entity count is capped by `max_entities`, so that the same
+/// suite works for a debug test.
+#[must_use]
+pub fn determinism_suite(ticks: u64, max_entities: usize) -> Vec<Scenario> {
+    let scenario = |name, entities: usize, seed, lethality, fragments| Scenario {
+        name,
+        config: SimConfig {
+            entities: entities.min(max_entities),
+            ticks,
+            workers: 1,
+            seed,
+            lethality,
+            fragments,
+        },
+    };
+    vec![
+        scenario("default", 100_000, 0x5EED_CAFE, 100, 1),
+        scenario("odd-count", 33_333, 7, 100, 1),
+        scenario("empty-world", 0, 1, 100, 1),
+        scenario("single-entity", 1, 42, 100, 1),
+        scenario("fragmented", 20_000, 0xF00D, 100, 4),
+        scenario("carnage", 20_000, 0xDEAD_BEEF, 2_000, 2),
+        scenario("calm", 20_000, 0xCA1A, 0, 1),
+    ]
+}
+
+/// The outcome of one scenario of the suite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScenarioOutcome {
+    /// The scenario name.
+    pub name: &'static str,
+    /// The scenario's entity count (after the cap).
+    pub entities: usize,
+    /// The scenario's tick count.
+    pub ticks: u64,
+    /// The history hash ([`history`]) of the first worker count's run.
+    pub history: u64,
+    /// Whether every worker count gave the same hashes on every tick.
+    pub verdict: Verdict,
+    /// Entities that died during the first run.
+    pub dead: u64,
+    /// The run time of every worker count, in order.
+    pub elapsed: Vec<Duration>,
+}
+
+/// Runs every scenario on every worker count of `workers` and compares the hashes of all ticks.
+///
+/// # Errors
+///
+/// The first error of a run.
+pub fn run_suite(
+    scenarios: &[Scenario],
+    workers: &[usize],
+) -> Result<Vec<ScenarioOutcome>, SimError> {
+    let mut outcomes = Vec::new();
+    for scenario in scenarios {
+        let mut reference: Option<SimReport> = None;
+        let mut verdict = Verdict::Same;
+        let mut elapsed = Vec::new();
+        for &count in workers {
+            let report = run(&SimConfig {
+                workers: count,
+                ..scenario.config.clone()
+            })?;
+            elapsed.push(report.elapsed);
+            match &reference {
+                None => reference = Some(report),
+                Some(first) => {
+                    if verdict == Verdict::Same
+                        && let Some(tick) = first_difference(&first.hashes, &report.hashes)
+                    {
+                        verdict = Verdict::Differs {
+                            workers: count,
+                            tick,
+                        };
+                    }
+                }
+            }
+        }
+        let first = reference.ok_or(SimError::Config("the suite needs a worker count"))?;
+        outcomes.push(ScenarioOutcome {
+            name: scenario.name,
+            entities: scenario.config.entities,
+            ticks: scenario.config.ticks,
+            history: history(&first.hashes),
+            verdict,
+            dead: first.dead,
+            elapsed,
+        });
+    }
+    Ok(outcomes)
+}
+
+/// One line of the golden file: the history hash of a scenario at an entity and tick count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoldenEntry {
+    /// The scenario name.
+    pub name: String,
+    /// Its entity count.
+    pub entities: usize,
+    /// Its tick count.
+    pub ticks: u64,
+    /// The expected history hash.
+    pub history: u64,
+}
+
+impl GoldenEntry {
+    fn key(&self) -> (&str, usize, u64) {
+        (&self.name, self.entities, self.ticks)
+    }
+}
+
+impl From<&ScenarioOutcome> for GoldenEntry {
+    fn from(outcome: &ScenarioOutcome) -> Self {
+        Self {
+            name: outcome.name.to_owned(),
+            entities: outcome.entities,
+            ticks: outcome.ticks,
+            history: outcome.history,
+        }
+    }
+}
+
+/// Parses a golden file: `name entities ticks history` per line (the hash in hex), `#` starts
+/// a comment.
+///
+/// # Errors
+///
+/// [`SimError::Golden`] naming the first malformed line.
+pub fn parse_golden(text: &str) -> Result<Vec<GoldenEntry>, SimError> {
+    let mut entries = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        let malformed = || SimError::Golden {
+            line: number.saturating_add(1),
+        };
+        let mut fields = line.split_whitespace();
+        let mut field = || fields.next().ok_or_else(malformed);
+        let name = field()?.to_owned();
+        let entities = field()?.parse().map_err(|_| malformed())?;
+        let ticks = field()?.parse().map_err(|_| malformed())?;
+        let history = u64::from_str_radix(field()?, 16).map_err(|_| malformed())?;
+        if fields.next().is_some() {
+            return Err(malformed());
+        }
+        entries.push(GoldenEntry {
+            name,
+            entities,
+            ticks,
+            history,
+        });
+    }
+    Ok(entries)
+}
+
+/// Formats a golden file, sorted by tick count, then in the given order, with a header.
+#[must_use]
+pub fn format_golden(entries: &[GoldenEntry]) -> String {
+    let mut sorted: Vec<&GoldenEntry> = entries.iter().collect();
+    sorted.sort_by_key(|e| e.ticks);
+    let mut text = String::from(
+        "# Golden history hashes of the ecs_sim determinism suite (DECISIONS #29).\n\
+         # Regenerate with `cargo run --release -p ecs_sim -- --suite --ticks N --bless`;\n\
+         # a change here means the simulation's behaviour changed: review it.\n\
+         # name entities ticks history\n",
+    );
+    for e in sorted {
+        text.push_str(&format!(
+            "{} {} {} {:016x}\n",
+            e.name, e.entities, e.ticks, e.history
+        ));
+    }
+    text
+}
+
+/// The result of checking a suite run against the golden entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoldenCheck {
+    /// The golden file has this scenario with the same hash.
+    Matches,
+    /// The golden file has no entry for this scenario, entity and tick count.
+    Missing,
+    /// The golden file expects another hash.
+    Differs {
+        /// The expected history hash.
+        expected: u64,
+    },
+}
+
+/// Checks one outcome against the golden entries.
+#[must_use]
+pub fn check_golden(golden: &[GoldenEntry], outcome: &ScenarioOutcome) -> GoldenCheck {
+    let actual = GoldenEntry::from(outcome);
+    match golden.iter().find(|e| e.key() == actual.key()) {
+        None => GoldenCheck::Missing,
+        Some(e) if e.history == actual.history => GoldenCheck::Matches,
+        Some(e) => GoldenCheck::Differs {
+            expected: e.history,
+        },
+    }
+}
+
+/// The golden entries with the outcomes' entries replaced or added.
+#[must_use]
+pub fn bless(golden: &[GoldenEntry], outcomes: &[ScenarioOutcome]) -> Vec<GoldenEntry> {
+    let fresh: Vec<GoldenEntry> = outcomes.iter().map(GoldenEntry::from).collect();
+    let mut entries: Vec<GoldenEntry> = golden
+        .iter()
+        .filter(|old| fresh.iter().all(|new| new.key() != old.key()))
+        .cloned()
+        .collect();
+    entries.extend(fresh);
+    entries
 }
