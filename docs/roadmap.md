@@ -11,7 +11,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 | M0 | 0.0.1 | Repository foundation | ✅ |
 | M1 | 0.1.0 | Entities and component storage | ✅ |
 | M2 | 0.2.0 | Queries | 🚧 |
-| M3 | 0.3.0 | Systems on the pragma.core frame graph, vertical slice | 📋 |
+| M3 | 0.3.0 | Systems on the pragma.core frame graph, vertical slice | 🚧 |
 | M4 | 0.4.0 | Commands, events, change detection | 📋 |
 | M5 | 0.5.0 | Hardening: determinism, fuzz, benches, semver | 📋 |
 | M6 | 1.0.0 | Stable API, publication | 📋 |
@@ -48,12 +48,20 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] Iteration benchmark (`criterion`, `benches/query.rs`)
 - [x] Property tests of queries against the oracle (`tests/oracle.rs`)
 
-## M3 — Systems and the vertical slice (0.3.0)
+## M3 — Systems and the vertical slice (0.3.0) 🚧
 
-- [ ] Systems as frame-graph tasks; access declared from their queries and resources
-- [ ] Conflicting systems without an explicit order fail at build time (pragma.core `GraphError::AmbiguousOrder`)
-- [ ] Resources (singletons)
-- [ ] Example: N entities, several systems, a per-tick state hash identical on 1 and N workers
+- [x] **Decisions:** function systems with sealed parameters (DECISIONS #17), columns lent to the
+  frame graph without `unsafe` (#18), strict ordering plus an `ordered()` mode (#19), resources in
+  the world (#20), schedule lifetime and error mapping (#21), the `ecs_sim` example crate (#22)
+- [x] Systems as frame-graph tasks (`Schedule`); access declared from their queries and resources
+  (`View`, `Res`, `ResMut`)
+- [x] Conflicting systems without an explicit order fail at build time (pragma.core
+  `GraphError::AmbiguousOrder` → `EcsError::AmbiguousOrder`)
+- [x] Resources (singletons): `World::insert_resource` and friends, `EcsError::MissingResource`
+- [x] Example: N entities, several systems, a per-tick state hash identical on 1, 2 and N workers
+  (`examples/ecs_sim`, its tests and `--verify`)
+- [x] Property tests of schedules: random system sets build iff no unordered conflict, a frame
+  equals a sequential run (`tests/schedule.rs`); frame benchmark (`benches/schedule.rs`)
 
 ## M4 — Commands, events, change detection (0.4.0)
 

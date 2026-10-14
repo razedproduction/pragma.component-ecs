@@ -307,7 +307,7 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     }
 
     /// Brings the cache of matching tables up to date with `world`.
-    fn update(&mut self, world: &World) -> Result<(), EcsError> {
+    pub(crate) fn update(&mut self, world: &World) -> Result<(), EcsError> {
         if self.world != Some(world.id()) {
             self.world = Some(world.id());
             self.seen = 0;
@@ -327,6 +327,11 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
             self.seen = id.saturating_add(1);
         }
         Ok(())
+    }
+
+    /// Ids of the matching tables, ascending, as of the last [`update`](Self::update).
+    pub(crate) fn matched(&self) -> &[usize] {
+        &self.matched
     }
 }
 
@@ -394,7 +399,7 @@ impl<'w> Iterator for TablesMut<'w, '_> {
 
 /// How a parallel query splits its rows.
 #[derive(Clone, Copy)]
-struct Plan {
+pub(crate) struct Plan {
     /// Rows per chunk, at least 1.
     size: usize,
     /// Number of chunks: a chunk never spans two tables.
@@ -402,7 +407,7 @@ struct Plan {
 }
 
 impl Plan {
-    fn new(lens: impl Iterator<Item = usize> + Clone, grain: Grain) -> Self {
+    pub(crate) fn new(lens: impl Iterator<Item = usize> + Clone, grain: Grain) -> Self {
         let total = lens.clone().fold(0, usize::saturating_add);
         let size = grain.chunk_size(total).max(1);
         let chunks = lens
@@ -413,7 +418,7 @@ impl Plan {
 }
 
 /// Splits the rows of every table into chunks by `plan` and runs `f` over them on `pool`.
-fn run<'w, Q, G>(
+pub(crate) fn run<'w, Q, G>(
     tables: impl Iterator<Item = (usize, Q::Slice<'w>)>,
     plan: Plan,
     pool: &ThreadPool,

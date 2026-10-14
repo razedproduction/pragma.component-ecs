@@ -1,0 +1,18 @@
+[package]
+name = "ecs_sim"
+description = "pragma.component-ecs vertical slice: world, queries and systems on the pragma.core frame graph"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+pragma_ecs = { workspace = true }
+pragma_core = { workspace = true, features = ["jobs", "graph"] }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

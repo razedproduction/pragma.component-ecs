@@ -1,7 +1,8 @@
 # Architecture
 
-Status: §2–3 are **implemented** (M1), queries in §4 too (M2); the rest is the **intended design**. Sections marked
-*open* are decided in the milestone named there and recorded in `DECISIONS.md`.
+Status: §2–3 are **implemented** (M1), queries in §4 too (M2), and systems, resources and
+schedules (M3); the rest is the **intended design**. Sections marked *open* are decided in the
+milestone named there and recorded in `DECISIONS.md`.
 
 ## 1. Place in the stack
 
@@ -63,7 +64,7 @@ a hybrid (sparse sets opt-in per type). A hybrid can be added later without chan
 methods (per-type configuration would change `Component`, see DECISIONS #8), by a new decision
 backed by benchmarks (M5).
 
-## 4. Queries (M2, DECISIONS #12–#15) and systems
+## 4. Queries (M2, DECISIONS #12–#15) and systems (M3, #17–#21)
 
 ```rust
 let mut movement = Query::<(&mut Position, &Velocity), Without<Frozen>>::new()?; // checks access
@@ -105,10 +106,77 @@ First numbers (`cargo bench -p pragma_ecs`, 100 000 entities, `(&mut Position, &
 table and ≈ 250 µs on 8, a plain `Vec<(Position, Velocity)>` ≈ 257 µs, a parallel query ≈ 170 µs
 (the update is memory-bound). Comparisons with `hecs` / `bevy_ecs` and a bench gate are M5.
 
-**Systems (M3).** A system is a function plus the union of its queries' and resources' accesses.
-Systems are registered as frame-graph tasks with those accesses, so pragma.core rejects
-conflicting systems without an explicit order at build time rather than letting them race at run
-time.
+### Systems and schedules (M3, DECISIONS #17–#21)
+
+```rust
+fn movement(mut bodies: View<(&mut Position, &Velocity)>, dt: Res<Dt>) -> Result<(), EcsError> { /* … */ }
+fn render(bodies: View<&Position>) { /* … */ }
+
+let mut builder = Schedule::builder();                 // or Schedule::builder().ordered()
+builder.add_system("movement", movement)?;
+builder.add_system_with("render", render, |c| c.after("movement"))?;
+let mut schedule = builder.build()?;                   // AmbiguousOrder without the `after`
+schedule.run(&mut world, &pool)?;                      // every frame
+```
+
+- **Systems.** A system is a plain function (or closure) of up to 8 parameters, each a sealed
+  `SystemParam`: `View<Q, F>` (a query over the frame's world, the counterpart of `Query<Q, F>`
+  with the same archetype cache), `Res<T>` and `ResMut<T>`. It returns `()` or `Result<(), E>`
+  for any error type. Its `Access` is the union of its parameters' accesses, components and
+  resources kept apart; a write together with another use of the same type in one system is
+  rejected by `add_system` (`ConflictingAccess` / `ConflictingResourceAccess`). The parameters'
+  state lives with the system in the schedule, behind a mutex nobody contends (a graph task runs
+  once per frame).
+- **Systems as graph tasks.** `ScheduleBuilder` registers every system as a task of a
+  `pragma_core` `FrameGraphBuilder`. The access is declared through function pointers stored in
+  each `Access` entry: reading component `T` is `reads::<Columns<T>>()`, writing it
+  `writes::<Columns<T>>()`, resource `T` is `reads`/`writes::<T>()`, and every system also reads
+  the world slot. pragma.core then validates the graph once: conflicting systems without an
+  explicit order are `GraphError::AmbiguousOrder`, mapped to `EcsError::AmbiguousOrder` with the
+  component or resource name. `ordered()` lets registration order settle conflicts.
+- **Lending the world to a frame.** Graph tasks are `'static` and reach data only through the
+  graph's `Resources` (one `RwLock` per type), so `Schedule::run` turns the world into resources
+  for the frame:
+
+  ```
+  before the frame                       during the frame (graph Resources)
+  table k: Vec<Position> ──swap──►  Columns<Position>.tables[k]   (RwLock, read or written)
+  table k: Vec<Velocity> ──swap──►  Columns<Velocity>.tables[k]
+  the World (types, entities,  ──►  WorldSlot(World)             (read by every system)
+             lent columns empty)
+  user resources               ──►  T                             (RwLock)
+  ```
+
+  Only the component types some system uses are lent. The world's resources already are a
+  `pragma_core` `Resources`, which also holds the `Columns<T>` slots and the world slot between
+  frames, so the frame needs no allocation once the slots exist: lending is `mem::swap` of each
+  table's `Vec<T>` with an empty one, and the slots grow (`try_reserve`) only when new tables
+  appear — before anything is lent, so an `OutOfMemory` leaves the world untouched. After the
+  frame, successful or not, the same swaps put everything back. Structural changes cannot
+  happen during a frame (systems get slices, never a `Vec` or `&mut World`); deferred commands
+  are M4.
+- **A view during the frame.** `View<Q, F>` holds the read or write guards of its `Columns<T>`
+  for the system's whole run, so the graph's locks are taken once per system, never per row; a
+  lock is never waited on because the graph only runs non-conflicting systems together. The
+  view updates its archetype cache from the world slot and walks the matching tables in
+  ascending order, splitting the `&mut [Vec<T>]` of a written type off table by table, as
+  `iter_mut` on the world does (no `unsafe`, DECISIONS #13 unchanged). `par_for_each(_mut)` use
+  the same chunks as queries, on the pool the frame runs on.
+- **Errors.** A missing resource is `EcsError::MissingResource` before any system runs. A system
+  that returns an error or panics stops the systems ordered after it in that frame (pragma.core
+  semantics) and is `SystemFailed { system, message, source }` (the `EcsError`, if it was one) or
+  `SystemPanicked`; other graph errors keep pragma.core's error as the source of
+  `EcsError::Schedule`. The schedule and the world stay usable after any error.
+- **Determinism.** Conflicting systems are always ordered, parallel iteration splits rows by the
+  data only, and tables and rows are visited in a fixed order, so a frame gives the same world on
+  any number of workers. `examples/ecs_sim` hashes the state after every tick and checks it on
+  1, 2 and N workers; `tests/schedule.rs` checks random system sets against a sequential run.
+
+First numbers (`cargo bench -p pragma_ecs --bench schedule`, 8 logical cores, release): one frame
+of four systems over 100 000 entities (`movement`, `aging` and `health` parallel over rows,
+`energy` a sequential sum, all four independent) ≈ 274 µs on the schedule, against ≈ 565 µs for
+the same updates as sequential queries on the world; the fixed cost of a frame of four systems
+on an empty world (lending, the graph, returning) ≈ 5.4 µs.
 
 ## 5. Reliability rules
 

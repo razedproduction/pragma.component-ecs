@@ -1,5 +1,6 @@
 //! The crate's error type.
 
+use pragma_core::graph::GraphError;
 use pragma_core::jobs::JobError;
 
 use crate::Entity;
@@ -29,7 +30,8 @@ pub enum EcsError {
     #[non_exhaustive]
     OutOfMemory {
         /// The entity count (or table row count) the storage tried to grow to; the world's entity
-        /// count for a query's cache, 0 when no world is involved (building a query's access).
+        /// count for a query's cache or a schedule's lending slots, 0 when no world is involved
+        /// (building a query's access, adding a system).
         entities: usize,
     },
 
@@ -68,8 +70,33 @@ pub enum EcsError {
         component: &'static str,
     },
 
-    /// A task of a parallel query failed: the closure panicked (the panic was caught) or the
-    /// pool cancelled the task. Rows of the other chunks were still processed.
+    /// A system uses a resource type twice and at least one use writes it, e.g.
+    /// `(Res<Score>, ResMut<Score>)`: the two borrows would alias (DECISIONS #17).
+    ///
+    /// ```
+    /// use pragma_ecs::{EcsError, Res, ResMut, Schedule};
+    ///
+    /// struct Score(u32);
+    ///
+    /// fn cheat(_: Res<Score>, _: ResMut<Score>) {}
+    ///
+    /// let err = Schedule::builder().add_system("cheat", cheat).err();
+    /// assert!(matches!(
+    ///     err,
+    ///     Some(EcsError::ConflictingResourceAccess { resource, .. }) if resource.ends_with("Score")
+    /// ));
+    /// ```
+    #[error(
+        "conflicting access to resource `{resource}`: it is written and also accessed elsewhere"
+    )]
+    #[non_exhaustive]
+    ConflictingResourceAccess {
+        /// The type name of the resource (`std::any::type_name`).
+        resource: &'static str,
+    },
+
+    /// A pool task failed: the closure of a parallel query panicked (the panic was caught) or
+    /// the pool cancelled the task. Rows of the other chunks were still processed.
     #[error("parallel query iteration failed: {source}")]
     #[non_exhaustive]
     Job {
@@ -77,4 +104,125 @@ pub enum EcsError {
         #[from]
         source: JobError,
     },
+
+    /// Two systems use the same data, at least one of them writes it, and neither is ordered
+    /// before the other (DECISIONS #19). Returned by
+    /// [`ScheduleBuilder::build`](crate::ScheduleBuilder::build).
+    ///
+    /// ```
+    /// use pragma_ecs::{EcsError, Schedule, View};
+    ///
+    /// struct Position(f32);
+    ///
+    /// fn movement(_: View<&mut Position>) {}
+    /// fn render(_: View<&Position>) {}
+    ///
+    /// let mut builder = Schedule::builder();
+    /// builder.add_system("movement", movement)?.add_system("render", render)?;
+    /// match builder.build() {
+    ///     Err(EcsError::AmbiguousOrder { first, second, data, .. }) => {
+    ///         assert_eq!((first.as_str(), second.as_str()), ("movement", "render"));
+    ///         assert!(data.ends_with("Position"));
+    ///     }
+    ///     other => panic!("unexpected {other:?}"),
+    /// }
+    /// # Ok::<(), EcsError>(())
+    /// ```
+    #[error(
+        "systems `{first}` and `{second}` conflict on `{data}` without an explicit order \
+         (add `after`/`before`, or build an `ordered()` schedule)"
+    )]
+    #[non_exhaustive]
+    AmbiguousOrder {
+        /// The system registered first.
+        first: String,
+        /// The system registered second.
+        second: String,
+        /// The type name of the component or resource both use.
+        data: String,
+    },
+
+    /// A system takes a resource the world does not have. Checked before any system of the
+    /// frame runs, so the frame did not start.
+    ///
+    /// ```
+    /// use pragma_core::prelude::{PoolConfig, ThreadPool};
+    /// use pragma_ecs::{EcsError, Res, Schedule, World};
+    ///
+    /// struct Gravity(f32);
+    ///
+    /// fn fall(_: Res<Gravity>) {}
+    ///
+    /// let mut builder = Schedule::builder();
+    /// builder.add_system("fall", fall)?;
+    /// let mut schedule = builder.build()?;
+    /// let pool = ThreadPool::new(PoolConfig::default().with_workers(1))?;
+    /// let err = schedule.run(&mut World::new(), &pool).err();
+    /// assert!(matches!(
+    ///     err,
+    ///     Some(EcsError::MissingResource { system, resource, .. })
+    ///         if system == "fall" && resource.ends_with("Gravity")
+    /// ));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[error("system `{system}` needs resource `{resource}`, which the world does not have")]
+    #[non_exhaustive]
+    MissingResource {
+        /// The first system that takes the resource.
+        system: String,
+        /// The type name of the resource.
+        resource: String,
+    },
+
+    /// A system returned an error (see [`SystemOutput`](crate::SystemOutput)). Independent
+    /// systems still ran; the systems ordered after it did not run in this frame.
+    #[error("system `{system}` failed: {message}")]
+    #[non_exhaustive]
+    SystemFailed {
+        /// The system's name.
+        system: String,
+        /// The message of the error the system returned (its `Display`).
+        message: String,
+        /// The error itself, if it was an `EcsError`.
+        source: Option<Box<EcsError>>,
+    },
+
+    /// A system panicked; the panic was caught. Independent systems still ran; the systems
+    /// ordered after it did not run in this frame.
+    #[error("system `{system}` panicked: {message}")]
+    #[non_exhaustive]
+    SystemPanicked {
+        /// The system's name.
+        system: String,
+        /// The panic message, if it was a string.
+        message: String,
+    },
+
+    /// Any other error of the `pragma_core` frame graph a schedule is built on: a dependency
+    /// cycle, an `after`/`before` naming an unknown system, a name used twice, a schedule too
+    /// large (DECISIONS #21).
+    ///
+    /// ```
+    /// use pragma_ecs::{EcsError, Schedule};
+    ///
+    /// fn tick() {}
+    ///
+    /// let mut builder = Schedule::builder();
+    /// builder.add_system_with("tick", tick, |c| c.after("input"))?;
+    /// assert!(matches!(builder.build(), Err(EcsError::Schedule { .. })));
+    /// # Ok::<(), EcsError>(())
+    /// ```
+    #[error("schedule error: {source}")]
+    #[non_exhaustive]
+    Schedule {
+        /// The error reported by the frame graph.
+        source: GraphError,
+    },
+}
+
+impl EcsError {
+    /// Wraps a frame-graph error that has no variant of its own.
+    pub(crate) const fn graph(source: GraphError) -> Self {
+        Self::Schedule { source }
+    }
 }

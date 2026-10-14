@@ -6,6 +6,30 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ### Added
 
+- Systems and schedules (M3): systems are plain functions of up to 8 parameters — `View<Q, F>`
+  (a query over the frame's world, with `iter`, `iter_mut`, `par_for_each`, `par_for_each_mut`
+  and the iterator `ViewIter`), `Res<T>`, `ResMut<T>` (sealed `SystemParam`) — returning `()`
+  or `Result<(), E>` for any error type (`SystemOutput`, `IntoSystem`). Their `Access` is the
+  union of their parameters' (DECISIONS #17). `Schedule::builder()` → `ScheduleBuilder`
+  (`add_system`, `add_system_with` with `SystemConfig::after` / `before`, `ordered`, `build`) →
+  `Schedule` (`run`, `systems`, `order`, `edges`, `len`, `is_empty`): every system is a task of
+  the `pragma_core` frame graph, systems with disjoint access run in parallel, and the columns of
+  the component types systems use are lent to the frame graph without `unsafe` (#18).
+- Conflicting systems without an explicit order fail `ScheduleBuilder::build` with the new
+  `EcsError::AmbiguousOrder` (from pragma.core `GraphError::AmbiguousOrder`, #19).
+- Resources (#20): the `Resource` trait (blanket over `Send + Sync + 'static`) and
+  `World::insert_resource`, `resource`, `resource_mut`, `remove_resource`,
+  `contains_resource`.
+- New errors (#21): `EcsError::ConflictingResourceAccess`, `MissingResource`, `SystemFailed`,
+  `SystemPanicked` and `Schedule` (other frame-graph errors, with pragma.core's `GraphError` as
+  the source).
+- `Access` covers resources too: `resource_kind_of`, `resources`; `conflict` compares both.
+- The vertical slice `examples/ecs_sim` (a workspace crate, `publish = false`, #22): N entities,
+  six systems, a per-tick state hash; its tests and `--verify` check the hashes on 1, 2 and N
+  workers.
+- Tests: random system sets build iff no unordered conflict and a frame equals a sequential run
+  on 1 and 4 workers (`tests/schedule.rs`); a frame without memory for new tables lends nothing
+  (`tests/oom.rs`). Benchmark `benches/schedule.rs`.
 - Queries (M2): `Query<Q, F = ()>` with `new`, `access`, `iter`, `iter_mut`, `par_for_each`,
   `par_for_each_mut`, and the iterators `QueryIter` / `QueryIterMut`. Query data (`QueryData`,
   `ReadOnlyQueryData`, sealed): `&T`, `&mut T`, `Option<&T>`, `Entity` and tuples of up to 8;
@@ -25,7 +49,9 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 ### Changed
 
 - `EcsError::OutOfMemory::entities` is documented for query allocations (the world's entity
-  count, or 0 when building a query's access).
+  count, or 0 when building a query's access or a schedule).
+- `EcsError::Job` now also covers parallel views inside systems.
+- The workspace includes `examples/*`.
 
 ## [0.1.0] - 2026-10-14
 
