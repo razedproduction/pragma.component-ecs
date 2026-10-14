@@ -1,8 +1,8 @@
 //! Archetype tables (DECISIONS #8): entities with the same component set share a table whose
 //! columns are parallel to its `entities` row list.
 
+use crate::hash::TypeIdMap;
 use std::any::TypeId;
-use std::collections::HashMap;
 
 use crate::component::{Column, ColumnData, Component, Ticks};
 use crate::{EcsError, Entity};
@@ -15,11 +15,11 @@ pub(crate) struct Archetype {
     /// The entity of every row.
     entities: Vec<Entity>,
     /// Cached transitions: the archetype reached by adding / removing one component type.
-    add_edges: HashMap<TypeId, usize>,
-    remove_edges: HashMap<TypeId, usize>,
+    add_edges: TypeIdMap<TypeId, usize>,
+    remove_edges: TypeIdMap<TypeId, usize>,
     /// Cached transitions by bundle type: the archetype reached by inserting the bundle
     /// (DECISIONS #35). From the empty archetype, the table a bundle spawns into.
-    bundle_edges: HashMap<TypeId, usize>,
+    bundle_edges: TypeIdMap<TypeId, usize>,
 }
 
 impl Archetype {
@@ -31,9 +31,9 @@ impl Archetype {
             types,
             columns,
             entities: Vec::new(),
-            add_edges: HashMap::new(),
-            remove_edges: HashMap::new(),
-            bundle_edges: HashMap::new(),
+            add_edges: TypeIdMap::default(),
+            remove_edges: TypeIdMap::default(),
+            bundle_edges: TypeIdMap::default(),
         }
     }
 

@@ -436,6 +436,7 @@ impl<Q: QueryData, F: QueryFilter> fmt::Debug for ViewIter<'_, Q, F> {
 
 impl<'a, Q: QueryData, F: QueryFilter> ViewIter<'a, Q, F> {
     /// The rows of the next matching table; `None` when every table was visited.
+    #[inline(always)]
     fn table(&mut self) -> Option<Option<Masked<'a, Q::Iter<'a>>>> {
         let &id = self.ids.next()?;
         let entities = self.tables.get(id)?.entities();
@@ -450,6 +451,7 @@ impl<'a, Q: QueryData, F: QueryFilter> ViewIter<'a, Q, F> {
 impl<'a, Q: QueryData, F: QueryFilter> Iterator for ViewIter<'a, Q, F> {
     type Item = Q::Item<'a>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(item) = self.rows.as_mut().and_then(Iterator::next) {

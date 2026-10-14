@@ -1,7 +1,7 @@
 //! The world: entities and their components in archetype tables.
 
+use crate::hash::TypeIdMap;
 use std::any::TypeId;
-use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -61,7 +61,7 @@ pub struct World {
     entities: Entities,
     archetypes: Vec<Archetype>,
     /// Archetype lookup by its sorted component type list.
-    by_types: HashMap<Vec<TypeId>, usize>,
+    by_types: TypeIdMap<Vec<TypeId>, usize>,
     /// The resources, and the slots a schedule lends the columns through (DECISIONS #18, #20).
     resources: Resources,
     /// The last change tick taken (DECISIONS #27).
@@ -93,7 +93,7 @@ impl World {
             id: NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed),
             entities: Entities::default(),
             archetypes: Vec::new(),
-            by_types: HashMap::new(),
+            by_types: TypeIdMap::default(),
             resources: Resources::new(),
             tick: 0,
             frame_base: 0,
@@ -204,7 +204,19 @@ impl World {
 
     /// Creates an entity without components.
     ///
-    /// Freed slots are reused with a bumped generation (see [`Entity`]).
+    /// Freed slots are reused with a bumped generation (see [`Entity`]). An entity that gets
+    /// several components at once is cheaper to create with [`spawn_bundle`](Self::spawn_bundle).
+    ///
+    /// ```
+    /// use pragma_ecs::World;
+    ///
+    /// let mut world = World::new();
+    /// let a = world.spawn()?;
+    /// let b = world.spawn()?;
+    /// assert_ne!(a, b);
+    /// assert_eq!(world.len(), 2);
+    /// # Ok::<(), pragma_ecs::EcsError>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -331,6 +343,17 @@ impl World {
     }
 
     /// Destroys `entity` and drops its components. Does not allocate.
+    ///
+    /// ```
+    /// use pragma_ecs::{EcsError, World};
+    ///
+    /// let mut world = World::new();
+    /// let rock = world.spawn_bundle(("rock", 3_u32))?;
+    /// world.despawn(rock)?;
+    /// assert!(!world.contains(rock));
+    /// assert!(matches!(world.despawn(rock), Err(EcsError::NoSuchEntity { entity, .. }) if entity == rock));
+    /// # Ok::<(), EcsError>(())
+    /// ```
     ///
     /// # Errors
     ///
