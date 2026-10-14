@@ -296,6 +296,13 @@ tools/bench_gate.py               A/B of PR base and head, normalized by a refer
   10 % slower **and** still more than 10 % slower after dividing by the shift of its reference
   in the same bench (a plain `Vec`, sequential queries, direct world operations, a plain read),
   `ecs_sim` ms/tick when it is slower than 10 % plus its own run-to-run noise.
+  A known fragility found by the first local run: the sequential `for` loop over 8 tables
+  (`query_iter/query_8_tables`) depends on code generation, not on our code — changing only
+  the crate version from 0.1.0 to 0.5.0 (which changes symbol hashes) moved it from ≈ 345 µs to
+  ≈ 480–550 µs on the same machine, reproducibly, while the 1-table, read-only and parallel
+  variants stayed put; `#[inline]` on the iterators' `next` did not help. The gate reports it
+  as a regression on the PR that bumps the version; making that loop robust (internal
+  iteration per table) is a follow-up.
 - **Semver.** `cargo semver-checks -p pragma_ecs` against the PR base: a breaking change needs a
   version bump (the version is 0.5.0 since M5).
 
