@@ -3,6 +3,7 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::archetype::{Archetype, two_mut};
 use crate::component::{Column, Component};
@@ -11,6 +12,9 @@ use crate::{EcsError, Entity};
 
 /// The archetype of entities without components; it is always the first one created.
 const EMPTY: usize = 0;
+
+/// The id of the next world created. 2^64 worlds will not be created in one process.
+static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A container of entities and their components.
 ///
@@ -47,6 +51,8 @@ const EMPTY: usize = 0;
 /// # Ok::<(), EcsError>(())
 /// ```
 pub struct World {
+    /// Unique per world in the process; ties a query's archetype cache to its world.
+    id: u64,
     entities: Entities,
     archetypes: Vec<Archetype>,
     /// Archetype lookup by its sorted component type list.
@@ -73,6 +79,7 @@ impl World {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            id: NEXT_WORLD_ID.fetch_add(1, Ordering::Relaxed),
             entities: Entities::default(),
             archetypes: Vec::new(),
             by_types: HashMap::new(),
@@ -317,6 +324,21 @@ impl World {
         self.archetypes
             .get_mut(location.archetype)?
             .get_mut::<T>(location.row)
+    }
+
+    /// The process-unique id of this world.
+    pub(crate) const fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The archetype tables, indexed by archetype id. Tables are only ever appended.
+    pub(crate) fn archetypes(&self) -> &[Archetype] {
+        &self.archetypes
+    }
+
+    /// The archetype tables, mutably (rows only: the set of tables does not change).
+    pub(crate) fn archetypes_mut(&mut self) -> &mut [Archetype] {
+        &mut self.archetypes
     }
 
     /// Records the new location of a moved entity and of the entity that took its old row.

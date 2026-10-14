@@ -20,3 +20,4 @@ pragma_ecs = 0   # entities, components, storage, queries, systems on the pragma
 # Deliberately accepted exceptions to the "no C/C++" rule.
 [purity.accepted]
 generator = "via pragma_core -> pragma_sync -> loom, only under cfg(loom) (pragma.core DECISIONS #7, #12); never reaches users' binaries (DECISIONS.md #5)"
+alloca = "via criterion, a dev dependency of the pragma_ecs benches only (pragma.core DECISIONS #17); never reaches users' binaries (DECISIONS.md #16)"

@@ -1,11 +1,17 @@
 //! Property test: random world operations against a naive `HashMap<Entity, components>` oracle.
+//!
+//! Queries are checked against the same oracle: after every operation each long-lived query
+//! (its archetype cache follows the world) yields exactly the entities and components the oracle
+//! computes, and mutating queries, sequential and parallel, change exactly those entities.
 // Test code: a panic is a test failure.
 #![allow(clippy::unwrap_used, clippy::panic, clippy::arithmetic_side_effects)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use pragma_ecs::{EcsError, Entity, World};
+use pragma_core::prelude::{Grain, PoolConfig, ThreadPool};
+use pragma_ecs::{EcsError, Entity, Query, With, Without, World};
 use proptest::prelude::*;
 use proptest::sample::Index;
 
@@ -47,6 +53,10 @@ enum Op {
     Insert(Index, Kind, i32),
     Remove(Index, Kind),
     Mutate(Index, i32),
+    /// Adds the value to `Pos` of every entity with a `Name` (plus 1 if it has a `Tag`).
+    QueryAdd(i32),
+    /// Adds the value to `Pos` of every entity without a `Tag`, in parallel, chunks of the size.
+    ParAdd(i32, usize),
 }
 
 fn kind() -> impl Strategy<Value = Kind> {
@@ -65,7 +75,48 @@ fn op() -> impl Strategy<Value = Op> {
         5 => (any::<Index>(), kind(), any::<i32>()).prop_map(|(i, k, v)| Op::Insert(i, k, v)),
         2 => (any::<Index>(), kind()).prop_map(|(i, k)| Op::Remove(i, k)),
         1 => (any::<Index>(), any::<i32>()).prop_map(|(i, v)| Op::Mutate(i, v)),
+        1 => any::<i32>().prop_map(Op::QueryAdd),
+        1 => (any::<i32>(), 1..8_usize).prop_map(|(v, size)| Op::ParAdd(v, size)),
     ]
+}
+
+/// One pool for every case: the worker count does not change results (DECISIONS #15).
+fn pool() -> &'static ThreadPool {
+    static POOL: OnceLock<ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| ThreadPool::new(PoolConfig::default().with_workers(3)).unwrap())
+}
+
+type Mixed = (
+    Entity,
+    Option<&'static Pos>,
+    &'static Name,
+    Option<&'static Tag>,
+);
+
+/// Long-lived queries: their caches see the archetypes created between operations.
+struct Queries {
+    pos: Query<(Entity, &'static Pos)>,
+    mixed: Query<Mixed, Without<Tracked>>,
+    tracked: Query<Entity, With<Tracked>>,
+    add: Query<(&'static mut Pos, Option<&'static Tag>), With<Name>>,
+    par_add: Query<(Entity, &'static mut Pos), Without<Tag>>,
+}
+
+impl Queries {
+    fn new() -> Self {
+        Self {
+            pos: Query::new().unwrap(),
+            mixed: Query::new().unwrap(),
+            tracked: Query::new().unwrap(),
+            add: Query::new().unwrap(),
+            par_add: Query::new().unwrap(),
+        }
+    }
+}
+
+fn sorted<T: Ord>(mut rows: Vec<T>) -> Vec<T> {
+    rows.sort();
+    rows
 }
 
 /// The entity of an `EcsError::NoSuchEntity`; any other error fails the test.
@@ -82,6 +133,7 @@ struct Harness {
     /// Every entity ever spawned, live or not: stale ids are exercised too.
     known: Vec<Entity>,
     token: Arc<()>,
+    queries: Queries,
 }
 
 impl Harness {
@@ -177,10 +229,100 @@ impl Harness {
                     expected.0 = expected.0.wrapping_add(v);
                 }
             }
+            Op::QueryAdd(v) => {
+                let mut visited = 0;
+                for (pos, tag) in self.queries.add.iter_mut(&mut self.world).unwrap() {
+                    pos.0 = pos.0.wrapping_add(v).wrapping_add(i32::from(tag.is_some()));
+                    visited += 1;
+                }
+                let mut expected = 0;
+                for row in self.oracle.values_mut() {
+                    if let (Some(pos), Some(_)) = (&mut row.pos, &row.name) {
+                        pos.0 = pos
+                            .0
+                            .wrapping_add(v)
+                            .wrapping_add(i32::from(row.tag.is_some()));
+                        expected += 1;
+                    }
+                }
+                assert_eq!(visited, expected);
+            }
+            Op::ParAdd(v, size) => {
+                let visited = Mutex::new(Vec::new());
+                self.queries
+                    .par_add
+                    .par_for_each_mut(&mut self.world, pool(), Grain::Fixed(size), |(e, pos)| {
+                        pos.0 = pos.0.wrapping_add(v);
+                        visited.lock().unwrap().push(e);
+                    })
+                    .unwrap();
+                let mut expected = Vec::new();
+                for (e, row) in &mut self.oracle {
+                    if let (Some(pos), None) = (&mut row.pos, &row.tag) {
+                        pos.0 = pos.0.wrapping_add(v);
+                        expected.push(*e);
+                    }
+                }
+                // Every matching entity exactly once.
+                assert_eq!(sorted(visited.into_inner().unwrap()), sorted(expected));
+            }
         }
     }
 
-    fn check(&self) {
+    /// Every query yields what the oracle computes.
+    fn check_queries(&mut self) {
+        let q = &mut self.queries;
+        let actual: Vec<_> = q
+            .pos
+            .iter(&self.world)
+            .unwrap()
+            .map(|(e, p)| (e, p.0))
+            .collect();
+        let expected: Vec<_> = self
+            .oracle
+            .iter()
+            .filter_map(|(e, r)| Some((*e, r.pos.as_ref()?.0)))
+            .collect();
+        assert_eq!(sorted(actual), sorted(expected.clone()));
+
+        // The same rows through a parallel read.
+        let count = AtomicUsize::new(0);
+        q.pos
+            .par_for_each(&self.world, pool(), Grain::Fixed(3), |(e, p)| {
+                assert_eq!(self.oracle.get(&e).and_then(|r| r.pos.as_ref()), Some(p));
+                count.fetch_add(1, Ordering::Relaxed);
+            })
+            .unwrap();
+        assert_eq!(count.into_inner(), expected.len());
+
+        let actual: Vec<_> = q
+            .mixed
+            .iter(&self.world)
+            .unwrap()
+            .map(|(e, p, n, t)| (e, p.cloned().map(|p| p.0), n.0.clone(), t.is_some()))
+            .collect();
+        let expected: Vec<_> = self
+            .oracle
+            .iter()
+            .filter(|(_, r)| !r.tracked)
+            .filter_map(|(e, r)| {
+                let name = r.name.as_ref()?.0.clone();
+                Some((*e, r.pos.as_ref().map(|p| p.0), name, r.tag.is_some()))
+            })
+            .collect();
+        assert_eq!(sorted(actual), sorted(expected));
+
+        let actual: Vec<_> = q.tracked.iter(&self.world).unwrap().collect();
+        let expected: Vec<_> = self
+            .oracle
+            .iter()
+            .filter_map(|(e, r)| r.tracked.then_some(*e))
+            .collect();
+        assert_eq!(sorted(actual), sorted(expected));
+    }
+
+    fn check(&mut self) {
+        self.check_queries();
         assert_eq!(self.world.len(), self.oracle.len());
         assert_eq!(self.world.is_empty(), self.oracle.is_empty());
         let mut tracked = 0;
@@ -225,6 +367,7 @@ proptest! {
             oracle: HashMap::new(),
             known: Vec::new(),
             token: Arc::new(()),
+            queries: Queries::new(),
         };
         for op in ops {
             h.apply(op);

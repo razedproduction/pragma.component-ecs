@@ -45,6 +45,17 @@ impl Archetype {
         &self.entities
     }
 
+    /// Number of rows.
+    pub(crate) fn len(&self) -> usize {
+        self.entities.len()
+    }
+
+    /// The component types, the columns (mutably) and the row entities at once, so that a query
+    /// can borrow several columns of the table (DECISIONS #13).
+    pub(crate) fn parts_mut(&mut self) -> (&[TypeId], &mut [Box<dyn Column>], &[Entity]) {
+        (&self.types, &mut self.columns, &self.entities)
+    }
+
     pub(crate) fn has(&self, ty: TypeId) -> bool {
         self.types.binary_search(&ty).is_ok()
     }
