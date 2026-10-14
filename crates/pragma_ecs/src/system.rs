@@ -10,7 +10,7 @@ use pragma_core::jobs::{Grain, ThreadPool};
 
 use crate::access::{Access, AccessKind};
 use crate::archetype::Archetype;
-use crate::query::{Plan, run};
+use crate::query::{Masked, Masks, Plan, run};
 use crate::{
     EcsError, Query, QueryData, QueryFilter, ReadOnlyQueryData, Res, ResMut, Resource, World,
 };
@@ -24,14 +24,26 @@ mod sealed {
     pub trait SealedSystem<Marker> {}
 }
 
-use sealed::{Sealed, SealedSystem};
+pub(crate) use sealed::Sealed;
+use sealed::SealedSystem;
 
-/// What a system sees while it runs: the frame's task context and the world's tables.
+/// The change ticks of one run of a system (DECISIONS #27).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SystemTicks {
+    /// The tick of the system's previous run; changes after it are new to the system.
+    pub(crate) last_run: u64,
+    /// The tick of this run, stamped on the system's writes.
+    pub(crate) this_run: u64,
+}
+
+/// What a system sees while it runs: the frame's task context, the world's tables and the
+/// system's change ticks.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
 pub struct Env<'w> {
     ctx: &'w TaskContext<'w>,
     world: &'w World,
+    ticks: SystemTicks,
 }
 
 impl fmt::Debug for Env<'_> {
@@ -43,13 +55,26 @@ impl fmt::Debug for Env<'_> {
 }
 
 impl<'w> Env<'w> {
-    pub(crate) const fn new(ctx: &'w TaskContext<'w>, world: &'w World) -> Self {
-        Self { ctx, world }
+    pub(crate) const fn new(
+        ctx: &'w TaskContext<'w>,
+        world: &'w World,
+        ticks: SystemTicks,
+    ) -> Self {
+        Self { ctx, world, ticks }
+    }
+
+    pub(crate) const fn ctx(&self) -> &'w TaskContext<'w> {
+        self.ctx
+    }
+
+    pub(crate) const fn world(&self) -> &'w World {
+        self.world
     }
 }
 
-/// A parameter of a system function: [`View<Q, F>`](View), [`Res<T>`](Res) or
-/// [`ResMut<T>`](ResMut).
+/// A parameter of a system function: [`View<Q, F>`](View), [`Res<T>`](Res),
+/// [`ResMut<T>`](ResMut), [`Commands`](crate::Commands), [`EventWriter<T>`](crate::EventWriter)
+/// or [`EventReader<T>`](crate::EventReader).
 ///
 /// A system's access is the union of its parameters' accesses; using a type for writing and
 /// also elsewhere in the same system is rejected when the system is added
@@ -91,6 +116,17 @@ pub trait SystemParam: Sealed {
         state: &'s mut Self::State,
         env: Env<'w>,
     ) -> Result<Self::Item<'w, 's>, EcsError>;
+
+    /// Applies what the parameter deferred to the sync point (commands, events) and empties
+    /// its buffers (DECISIONS #24).
+    #[doc(hidden)]
+    fn apply(_state: &mut Self::State, _world: &mut World) -> Result<(), EcsError> {
+        Ok(())
+    }
+
+    /// Drops what the parameter deferred, without applying it (DECISIONS #25).
+    #[doc(hidden)]
+    fn discard(_state: &mut Self::State) {}
 }
 
 /// A system parameter: the entities that have the components `Q` asks for and pass the filter
@@ -110,14 +146,14 @@ pub trait SystemParam: Sealed {
 /// struct Frozen;
 ///
 /// fn movement(mut bodies: View<(&mut Position, &Velocity), Without<Frozen>>) -> Result<(), EcsError> {
-///     for (position, velocity) in bodies.iter_mut()? {
+///     for (mut position, velocity) in bodies.iter_mut()? {
 ///         position.0 += velocity.0;
 ///     }
 ///     Ok(())
 /// }
 ///
 /// fn drift(mut positions: View<&mut Position>) -> Result<(), EcsError> {
-///     positions.par_for_each_mut(Grain::Auto, |position| position.0 += 0.5)
+///     positions.par_for_each_mut(Grain::Auto, |mut position| position.0 += 0.5)
 /// }
 ///
 /// let mut world = World::new();
@@ -146,6 +182,9 @@ pub struct View<'w, 's, Q: QueryData, F: QueryFilter = ()> {
     world: &'w World,
     pool: &'w ThreadPool,
     guard: Q::Guard<'w>,
+    /// The tick columns a row filter reads that `guard` does not hold.
+    filter: F::Guard<'w>,
+    ticks: SystemTicks,
     query: &'s mut Query<Q, F>,
 }
 
@@ -191,7 +230,7 @@ impl<'w, Q: QueryData, F: QueryFilter> View<'w, '_, Q, F> {
     /// # Errors
     ///
     /// [`EcsError::OutOfMemory`] if the cache of matching tables cannot grow.
-    pub fn iter(&mut self) -> Result<ViewIter<'_, Q>, EcsError>
+    pub fn iter(&mut self) -> Result<ViewIter<'_, Q, F>, EcsError>
     where
         Q: ReadOnlyQueryData,
     {
@@ -206,7 +245,7 @@ impl<'w, Q: QueryData, F: QueryFilter> View<'w, '_, Q, F> {
     /// struct Health(u32);
     ///
     /// fn heal(mut healths: View<&mut Health>) -> Result<(), EcsError> {
-    ///     for health in healths.iter_mut()? {
+    ///     for mut health in healths.iter_mut()? {
     ///         health.0 += 1;
     ///     }
     ///     Ok(())
@@ -217,7 +256,7 @@ impl<'w, Q: QueryData, F: QueryFilter> View<'w, '_, Q, F> {
     /// # Errors
     ///
     /// [`EcsError::OutOfMemory`] if the cache of matching tables cannot grow.
-    pub fn iter_mut(&mut self) -> Result<ViewIter<'_, Q>, EcsError> {
+    pub fn iter_mut(&mut self) -> Result<ViewIter<'_, Q, F>, EcsError> {
         self.rows()
     }
 
@@ -270,12 +309,14 @@ impl<'w, Q: QueryData, F: QueryFilter> View<'w, '_, Q, F> {
         self.par_rows(grain, f)
     }
 
-    fn rows(&mut self) -> Result<ViewIter<'_, Q>, EcsError> {
-        self.query.update(self.world)?;
+    fn rows(&mut self) -> Result<ViewIter<'_, Q, F>, EcsError> {
+        self.prepare()?;
         Ok(ViewIter {
             tables: self.world.archetypes(),
             ids: self.query.matched().iter(),
+            masks: Masks::new(self.query.mask()),
             cursor: Q::cursor(&mut self.guard),
+            tick: self.ticks.this_run,
             rows: None,
         })
     }
@@ -284,7 +325,7 @@ impl<'w, Q: QueryData, F: QueryFilter> View<'w, '_, Q, F> {
     where
         G: Fn(Q::Item<'a>) + Sync,
     {
-        self.query.update(self.world)?;
+        self.prepare()?;
         let tables: &'a [Archetype] = self.world.archetypes();
         let matched = self.query.matched();
         let plan = Plan::new(
@@ -294,12 +335,32 @@ impl<'w, Q: QueryData, F: QueryFilter> View<'w, '_, Q, F> {
                 .map(Archetype::len),
             grain,
         );
+        let tick = self.ticks.this_run;
+        let mut masks = Masks::<F>::new(self.query.mask());
         let mut cursor = Q::cursor(&mut self.guard);
         let rows = matched.iter().filter_map(|&id| {
             let entities = tables.get(id)?.entities();
-            Some((entities.len(), Q::lent(&mut cursor, id, entities)?))
+            let mask = masks.take(entities.len());
+            Some((
+                entities.len(),
+                Q::lent(&mut cursor, id, entities, tick)?,
+                mask,
+            ))
         });
         run::<Q, G>(rows, plan, self.pool, &f, self.world.len())
+    }
+
+    /// Brings the archetype cache up to date and fills the row mask of a row filter from the
+    /// lent tick columns: the filter's own guards, or the data's for a type it holds.
+    fn prepare(&mut self) -> Result<(), EcsError> {
+        self.query.update(self.world)?;
+        let (filter, guard) = (&self.filter, &self.guard);
+        self.query.fill_mask(
+            self.world.archetypes(),
+            self.ticks.last_run,
+            self.world.len(),
+            |id, ty| F::lent_ticks(filter, ty, id).or_else(|| Q::lent_ticks(guard, ty, id)),
+        )
     }
 }
 
@@ -318,7 +379,12 @@ where
     }
 
     fn declare(access: &mut Access) -> Result<(), EcsError> {
-        Q::declare(access)
+        // A filter's read merges into the same view's data access, not into other parameters'
+        // (DECISIONS #28).
+        let mut view = Access::new();
+        Q::declare(&mut view)?;
+        F::declare(&mut view)?;
+        access.merge(&view)
     }
 
     fn fetch<'w, 's>(
@@ -329,6 +395,8 @@ where
             world: env.world,
             pool: env.ctx.pool(),
             guard: Q::acquire(env.ctx)?,
+            filter: F::acquire::<Q>(env.ctx)?,
+            ticks: env.ticks,
             query: state,
         })
     }
@@ -346,15 +414,19 @@ where
 /// }
 /// # let _ = count;
 /// ```
-pub struct ViewIter<'a, Q: QueryData> {
+pub struct ViewIter<'a, Q: QueryData, F: QueryFilter = ()> {
     tables: &'a [Archetype],
     ids: slice::Iter<'a, usize>,
+    /// The row mask of the tables not visited yet.
+    masks: Masks<'a, F>,
     cursor: Q::Cursor<'a>,
+    /// The change tick a write stamps.
+    tick: u64,
     /// The rest of the current table.
-    rows: Option<Q::Iter<'a>>,
+    rows: Option<Masked<'a, Q::Iter<'a>>>,
 }
 
-impl<Q: QueryData> fmt::Debug for ViewIter<'_, Q> {
+impl<Q: QueryData, F: QueryFilter> fmt::Debug for ViewIter<'_, Q, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ViewIter")
             .field("tables_left", &self.ids.len())
@@ -362,7 +434,20 @@ impl<Q: QueryData> fmt::Debug for ViewIter<'_, Q> {
     }
 }
 
-impl<'a, Q: QueryData> Iterator for ViewIter<'a, Q> {
+impl<'a, Q: QueryData, F: QueryFilter> ViewIter<'a, Q, F> {
+    /// The rows of the next matching table; `None` when every table was visited.
+    fn table(&mut self) -> Option<Option<Masked<'a, Q::Iter<'a>>>> {
+        let &id = self.ids.next()?;
+        let entities = self.tables.get(id)?.entities();
+        let mask = self.masks.take(entities.len());
+        Some(
+            Q::lent(&mut self.cursor, id, entities, self.tick)
+                .map(|rows| Masked::new(Q::iter(rows), mask)),
+        )
+    }
+}
+
+impl<'a, Q: QueryData, F: QueryFilter> Iterator for ViewIter<'a, Q, F> {
     type Item = Q::Item<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -370,13 +455,22 @@ impl<'a, Q: QueryData> Iterator for ViewIter<'a, Q> {
             if let Some(item) = self.rows.as_mut().and_then(Iterator::next) {
                 return Some(item);
             }
-            let &id = self.ids.next()?;
-            let tables = self.tables;
-            self.rows = tables
-                .get(id)
-                .and_then(|table| Q::lent(&mut self.cursor, id, table.entities()))
-                .map(Q::iter);
+            self.rows = self.table()?;
         }
+    }
+
+    fn fold<B, G: FnMut(B, Self::Item) -> B>(mut self, init: B, mut g: G) -> B {
+        let mut acc = self
+            .rows
+            .take()
+            .into_iter()
+            .fold(init, |acc, rows| rows.fold(acc, &mut g));
+        while let Some(rows) = self.table() {
+            acc = rows
+                .into_iter()
+                .fold(acc, |acc, rows| rows.fold(acc, &mut g));
+        }
+        acc
     }
 }
 
@@ -500,6 +594,12 @@ impl fmt::Debug for Prepared {
 pub trait RunSystem: Send {
     /// Runs the system once.
     fn run(&mut self, env: Env<'_>) -> Result<(), BoxError>;
+
+    /// Applies what the system's parameters deferred to the sync point.
+    fn apply(&mut self, world: &mut World) -> Result<(), EcsError>;
+
+    /// Drops what the system's parameters deferred.
+    fn discard(&mut self);
 }
 
 /// A function that can be added to a [`Schedule`](crate::Schedule) as a system.
@@ -558,6 +658,17 @@ macro_rules! function_system {
                 let ($($value,)*) = state;
                 Ok(($($param::fetch($value, env)?,)*))
             }
+
+            fn apply(state: &mut Self::State, world: &mut World) -> Result<(), EcsError> {
+                let ($($value,)*) = state;
+                $($param::apply($value, world)?;)*
+                Ok(())
+            }
+
+            fn discard(state: &mut Self::State) {
+                let ($($value,)*) = state;
+                $($param::discard($value);)*
+            }
         }
 
         impl<Func, Out, $($param),*> SealedSystem<fn($($param,)*) -> Out> for Func
@@ -613,6 +724,14 @@ macro_rules! function_system {
                 }
                 let ($($value,)*) = <($($param,)*) as SystemParam>::fetch(&mut self.state, env)?;
                 call(&mut self.func, $($value),*).into_result()
+            }
+
+            fn apply(&mut self, world: &mut World) -> Result<(), EcsError> {
+                <($($param,)*) as SystemParam>::apply(&mut self.state, world)
+            }
+
+            fn discard(&mut self) {
+                <($($param,)*) as SystemParam>::discard(&mut self.state);
             }
         }
     };

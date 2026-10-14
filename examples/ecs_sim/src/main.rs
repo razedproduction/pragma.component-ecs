@@ -85,13 +85,15 @@ fn main() -> ExitCode {
         Ok(report) => {
             let last = report.hashes.last().copied().unwrap_or_default();
             println!(
-                "{} entities, {} ticks on {} workers (default {}): {:?}, {} dead, final hash {last:016x}",
+                "{} entities, {} ticks on {} workers (default {}): {:?}, {} died, {} born, {} alive, final hash {last:016x}",
                 args.config.entities,
                 args.config.ticks,
                 args.config.workers,
                 default_workers(),
                 report.elapsed,
                 report.dead,
+                report.births,
+                report.alive,
             );
             ExitCode::SUCCESS
         }

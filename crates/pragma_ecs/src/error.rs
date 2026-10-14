@@ -198,6 +198,36 @@ pub enum EcsError {
         message: String,
     },
 
+    /// Applying the commands or events a system deferred to the sync point failed, e.g. out of
+    /// memory while spawning (DECISIONS #25). The commands applied before stay applied; the
+    /// failing one and everything deferred after it, by this and later systems, were discarded.
+    /// A command on an entity that is gone is not an error: it does nothing.
+    ///
+    /// ```
+    /// use pragma_core::prelude::ThreadPool;
+    /// use pragma_ecs::{EcsError, Schedule, World};
+    ///
+    /// fn frame(schedule: &mut Schedule, world: &mut World, pool: &ThreadPool) -> Result<(), EcsError> {
+    ///     match schedule.run(world, pool) {
+    ///         Err(EcsError::CommandFailed { system, source, .. }) => {
+    ///             // The world is consistent: report, free memory, run the next frame.
+    ///             eprintln!("commands of `{system}` were not applied: {source}");
+    ///             Ok(())
+    ///         }
+    ///         other => other,
+    ///     }
+    /// }
+    /// # let _ = frame;
+    /// ```
+    #[error("applying the commands of system `{system}` failed: {source}")]
+    #[non_exhaustive]
+    CommandFailed {
+        /// The system whose commands or events could not be applied.
+        system: String,
+        /// Why: [`EcsError::OutOfMemory`] or [`EcsError::CapacityExhausted`].
+        source: Box<EcsError>,
+    },
+
     /// Any other error of the `pragma_core` frame graph a schedule is built on: a dependency
     /// cycle, an `after`/`before` naming an unknown system, a name used twice, a schedule too
     /// large (DECISIONS #21).

@@ -1,21 +1,28 @@
-//! `ecs_sim` is the vertical slice of `pragma.component-ecs` (milestone M3, DECISIONS #22): a
-//! headless fixed-step simulation through the whole stack.
+//! `ecs_sim` is the vertical slice of `pragma.component-ecs` (milestones M3 and M4, DECISIONS
+//! #22): a headless fixed-step simulation through the whole stack.
 //!
-//! - **World**: N entities with a position, a velocity, health and age, in archetype tables;
-//!   entities whose health runs out get a `Dead` marker between ticks, so they move to another
-//!   table while the simulation runs.
-//! - **Systems** on one [`Schedule`] over the `pragma_core` frame graph: `clock`, `steer`,
-//!   `movement`, `hazard`, `aging` and `hash`, with access derived from their parameters. Data
-//!   dependencies are ordered explicitly; `aging` shares nothing with the others and runs in
-//!   parallel with them. The per-entity systems split their rows over the pool.
-//! - **State hash** of every tick: an FNV-1a hash of every entity's id and components, computed
-//!   by the last system in table and row order.
+//! - **World**: N entities with a position, a velocity, health and age, in archetype tables.
+//! - **Systems** on one [`Schedule`] over the `pragma_core` frame graph, with access derived from
+//!   their parameters: `clock`, `steer`, `movement`, `hazard`, `aging`, `reap`, `respawn`,
+//!   `alarm`, `census` and `hash`. Data dependencies are ordered explicitly; the rest runs in
+//!   parallel. The per-entity systems split their rows over the pool.
+//! - **Commands and events** (M4): `reap` marks entities whose health ran out as [`Dead`] through
+//!   [`Commands`] and sends a [`Death`] event; one frame later `respawn` reads the event, despawns
+//!   the dead entity and spawns a replacement at the edge of the arena, again through commands.
+//!   The structural changes happen at the schedule's sync point, inside `Schedule::run`.
+//! - **Change detection** (M4): `hazard` writes health only when it really changes; `alarm`
+//!   counts the living entities whose health changed in this tick and is critical
+//!   (`Changed<Health>`), `census` counts the newborn (`Added<Age>`).
+//! - **State hash** of every tick: an FNV-1a hash of every entity's id and components and of
+//!   the counters, computed by the last system in table and row order.
 //!
 //! ## Determinism
 //!
 //! The hash of every tick depends only on the configuration, not on the number of workers: the
 //! per-entity updates are element-wise (the row split depends only on the data), the hash is a
-//! sequential fold in a fixed order, and every conflicting pair of systems is ordered.
+//! sequential fold in a fixed order, every conflicting pair of systems is ordered, commands and
+//! events are applied in system registration order, and change ticks follow the schedule's
+//! topological order.
 //!
 //! ```
 //! use ecs_sim::{SimConfig, run};
@@ -31,7 +38,10 @@
 use std::time::{Duration, Instant};
 
 use pragma_core::jobs::{Grain, JobsError, PoolConfig, ThreadPool};
-use pragma_ecs::{EcsError, Entity, Query, Res, ResMut, Schedule, View, With, Without, World};
+use pragma_ecs::{
+    Added, Changed, Commands, EcsError, Entity, EventReader, EventWriter, Res, ResMut, Schedule,
+    View, Without, World,
+};
 
 /// The side of the square arena.
 const ARENA: f32 = 1024.0;
@@ -46,6 +56,8 @@ const HAZARD_RADIUS: f32 = 160.0;
 const HAZARD_DPS: f32 = 30.0;
 const REGEN: f32 = 2.0;
 const MAX_HEALTH: f32 = 100.0;
+/// Health below which `alarm` counts an entity as critical.
+const CRITICAL: f32 = 25.0;
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -101,8 +113,12 @@ pub fn default_workers() -> usize {
 pub struct SimReport {
     /// The state hash after every tick.
     pub hashes: Vec<u64>,
-    /// Entities marked dead by the end of the run.
-    pub dead: usize,
+    /// Entities that died during the run.
+    pub dead: u64,
+    /// Entities spawned during the run (replacements of the dead).
+    pub births: u64,
+    /// Living entities at the end of the run.
+    pub alive: usize,
     /// Run time.
     pub elapsed: Duration,
 }
@@ -125,7 +141,7 @@ pub struct Velocity {
     pub y: f32,
 }
 
-/// Health; at zero or below the entity is marked [`Dead`] between ticks.
+/// Health; at zero or below the entity dies.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Health(pub f32);
 
@@ -133,9 +149,18 @@ pub struct Health(pub f32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Age(pub u32);
 
-/// A marker: the entity no longer moves or takes damage.
+/// A marker: the entity died and will be replaced in the next tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dead;
+
+/// An event: `entity` died at tick `tick`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Death {
+    /// The entity that died.
+    pub entity: Entity,
+    /// The tick of its death.
+    pub tick: u64,
+}
 
 /// The current tick (a resource).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,7 +170,19 @@ pub struct Tick(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateHash(pub u64);
 
-/// A deterministic generator for the initial state (SplitMix64).
+/// Deaths handled so far (a resource).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deaths(pub u64);
+
+/// Births so far: entities whose `Age` was added since `census` last ran (a resource).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Births(pub u64);
+
+/// Living entities whose health changed in the last tick and is critical (a resource).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Alarm(pub u64);
+
+/// A deterministic generator (SplitMix64).
 struct Rng(u64);
 
 impl Rng {
@@ -186,7 +223,7 @@ fn steer(
     } else {
         -SWIRL
     };
-    bodies.par_for_each_mut(Grain::Auto, |(position, velocity)| {
+    bodies.par_for_each_mut(Grain::Auto, |(position, mut velocity)| {
         let (dx, dy) = (CENTER - position.x, CENTER - position.y);
         let distance = (dx * dx + dy * dy).sqrt().max(1.0);
         velocity.x = (velocity.x + (dx * PULL - dy / distance * swirl) * DT) * DRAG;
@@ -196,28 +233,100 @@ fn steer(
 
 /// Moves every living entity, clamped to the arena.
 fn movement(mut bodies: View<(&mut Position, &Velocity), Without<Dead>>) -> Result<(), EcsError> {
-    bodies.par_for_each_mut(Grain::Auto, |(position, velocity)| {
+    bodies.par_for_each_mut(Grain::Auto, |(mut position, velocity)| {
         position.x = (position.x + velocity.x * DT).clamp(0.0, ARENA);
         position.y = (position.y + velocity.y * DT).clamp(0.0, ARENA);
     })
 }
 
-/// Damages living entities inside the hazard, heals the others.
+/// Damages living entities inside the hazard, heals the others. Writes only a health that
+/// really changes, so that `Changed<Health>` means something (DECISIONS #28).
 fn hazard(mut bodies: View<(&Position, &mut Health), Without<Dead>>) -> Result<(), EcsError> {
-    bodies.par_for_each_mut(Grain::Auto, |(position, health)| {
+    bodies.par_for_each_mut(Grain::Auto, |(position, mut health)| {
         let (dx, dy) = (position.x - CENTER, position.y - CENTER);
         let change = if dx * dx + dy * dy < HAZARD_RADIUS * HAZARD_RADIUS {
             -HAZARD_DPS
         } else {
             REGEN
         };
-        health.0 = (health.0 + change * DT).min(MAX_HEALTH);
+        let next = (health.0 + change * DT).min(MAX_HEALTH);
+        if next.to_bits() != health.0.to_bits() {
+            health.0 = next;
+        }
     })
 }
 
-/// Ages every entity, dead or alive. Shares no data with the other systems but `hash`.
+/// Ages every entity, dead or alive.
 fn aging(mut ages: View<&mut Age>) -> Result<(), EcsError> {
-    ages.par_for_each_mut(Grain::Auto, |age| age.0 = age.0.wrapping_add(1))
+    ages.par_for_each_mut(Grain::Auto, |mut age| age.0 = age.0.wrapping_add(1))
+}
+
+/// Marks the entities whose health ran out as [`Dead`] and announces their death. Both take
+/// effect at the end of the frame (DECISIONS #24, #26).
+fn reap(
+    mut bodies: View<(Entity, &Health), Without<Dead>>,
+    tick: Res<Tick>,
+    mut commands: Commands,
+    mut deaths: EventWriter<Death>,
+) -> Result<(), EcsError> {
+    for (entity, health) in bodies.iter()? {
+        if health.0 <= 0.0 {
+            commands.insert(entity, Dead)?;
+            deaths.send(Death {
+                entity,
+                tick: tick.0,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Replaces every entity that died in the previous tick: despawns it and spawns a newborn at
+/// the edge of the arena, at a position derived from the dead entity and the tick.
+fn respawn(
+    mut died: EventReader<Death>,
+    mut commands: Commands,
+    mut total: ResMut<Deaths>,
+) -> Result<(), EcsError> {
+    for death in died.read() {
+        commands.despawn(death.entity)?;
+        let mut rng = Rng(death.entity.to_bits() ^ death.tick.rotate_left(32));
+        let along = rng.unit() * ARENA;
+        let position = match rng.next() % 4 {
+            0 => Position { x: along, y: 0.0 },
+            1 => Position { x: along, y: ARENA },
+            2 => Position { x: 0.0, y: along },
+            _ => Position { x: ARENA, y: along },
+        };
+        commands
+            .spawn()?
+            .insert(position)?
+            .insert(Velocity {
+                x: (rng.unit() - 0.5) * 100.0,
+                y: (rng.unit() - 0.5) * 100.0,
+            })?
+            .insert(Health(MAX_HEALTH))?
+            .insert(Age(0))?;
+        total.0 = total.0.wrapping_add(1);
+    }
+    Ok(())
+}
+
+/// Counts the living entities whose health changed since this system last ran and is critical.
+fn alarm(
+    mut changed: View<&Health, (Changed<Health>, Without<Dead>)>,
+    mut alarm: ResMut<Alarm>,
+) -> Result<(), EcsError> {
+    let critical = changed.iter()?.filter(|h| h.0 < CRITICAL).count();
+    alarm.0 = u64::try_from(critical).unwrap_or(u64::MAX);
+    Ok(())
+}
+
+/// Counts the entities born since this system last ran.
+fn census(mut born: View<Entity, Added<Age>>, mut births: ResMut<Births>) -> Result<(), EcsError> {
+    let count = u64::try_from(born.iter()?.count()).unwrap_or(u64::MAX);
+    births.0 = births.0.wrapping_add(count);
+    Ok(())
 }
 
 /// Everything the state hash covers, per entity.
@@ -230,10 +339,13 @@ type Snapshot = (
     Option<&'static Dead>,
 );
 
-/// The state hash: every entity's id and components, in table and row order.
+/// The state hash: every entity's id and components, in table and row order, and the counters.
 fn hash(
     mut rows: View<Snapshot>,
     tick: Res<Tick>,
+    deaths: Res<Deaths>,
+    births: Res<Births>,
+    alarm: Res<Alarm>,
     mut state: ResMut<StateHash>,
 ) -> Result<(), EcsError> {
     let mut h = fnv(FNV_OFFSET, tick.0);
@@ -250,12 +362,14 @@ fn hash(
         h = fnv(h, u64::from(health.0.to_bits()) << 32 | u64::from(age.0));
         h = fnv(h, u64::from(dead.is_some()));
     }
-    state.0 = h;
+    h = fnv(h, deaths.0);
+    h = fnv(h, births.0);
+    state.0 = fnv(h, alarm.0);
     Ok(())
 }
 
-/// The systems of one tick. Conflicting pairs are ordered explicitly; `aging` runs in
-/// parallel with everything before `hash`.
+/// The systems of one tick. Conflicting pairs are ordered explicitly; `aging`, `census` and
+/// `respawn` run in parallel with the movement chain.
 ///
 /// # Errors
 ///
@@ -268,7 +382,17 @@ pub fn schedule() -> Result<Schedule, EcsError> {
     builder.add_system_with("movement", movement, |c| c.after("steer"))?;
     builder.add_system_with("hazard", hazard, |c| c.after("movement"))?;
     builder.add_system("aging", aging)?;
-    builder.add_system_with("hash", hash, |c| c.after("hazard").after("aging"))?;
+    builder.add_system_with("reap", reap, |c| c.after("hazard"))?;
+    builder.add_system_with("respawn", respawn, |c| c.after("clock"))?;
+    builder.add_system_with("alarm", alarm, |c| c.after("hazard"))?;
+    builder.add_system_with("census", census, |c| c.after("aging"))?;
+    builder.add_system_with("hash", hash, |c| {
+        c.after("hazard")
+            .after("aging")
+            .after("respawn")
+            .after("alarm")
+            .after("census")
+    })?;
     builder.build()
 }
 
@@ -301,24 +425,10 @@ pub fn populate(config: &SimConfig) -> Result<World, EcsError> {
     }
     world.insert_resource(Tick(0));
     world.insert_resource(StateHash(0));
+    world.insert_resource(Deaths(0));
+    world.insert_resource(Births(0));
+    world.insert_resource(Alarm(0));
     Ok(world)
-}
-
-/// Marks the entities whose health ran out as [`Dead`]: a structural change between ticks,
-/// which moves them to another table.
-fn bury(
-    world: &mut World,
-    dying: &mut Query<(Entity, &Health), Without<Dead>>,
-) -> Result<(), EcsError> {
-    let dead: Vec<Entity> = dying
-        .iter(world)?
-        .filter(|(_, health)| health.0 <= 0.0)
-        .map(|(entity, _)| entity)
-        .collect();
-    for entity in dead {
-        world.insert(entity, Dead)?;
-    }
-    Ok(())
 }
 
 /// Runs the simulation and returns the state hash of every tick.
@@ -337,7 +447,6 @@ pub fn run(config: &SimConfig) -> Result<SimReport, SimError> {
     let pool = ThreadPool::new(PoolConfig::default().with_workers(config.workers))?;
     let mut schedule = schedule()?;
     let mut world = populate(config)?;
-    let mut dying = Query::<(Entity, &Health), Without<Dead>>::new()?;
     let ticks = usize::try_from(config.ticks).map_err(|_| SimError::Config("too many ticks"))?;
     let mut hashes = Vec::new();
     hashes
@@ -348,13 +457,17 @@ pub fn run(config: &SimConfig) -> Result<SimReport, SimError> {
     for _ in 0..config.ticks {
         schedule.run(&mut world, &pool)?;
         hashes.push(world.resource::<StateHash>().map_or(0, |h| h.0));
-        bury(&mut world, &mut dying)?;
     }
     let elapsed = start.elapsed();
-    let dead = Query::<Entity, With<Dead>>::new()?.iter(&world)?.count();
+    // The initial population counts as born on the first census.
+    let initial = u64::try_from(config.entities).unwrap_or(u64::MAX);
     Ok(SimReport {
         hashes,
-        dead,
+        dead: world.resource::<Deaths>().map_or(0, |d| d.0),
+        births: world
+            .resource::<Births>()
+            .map_or(0, |b| b.0.saturating_sub(initial)),
+        alive: world.len(),
         elapsed,
     })
 }

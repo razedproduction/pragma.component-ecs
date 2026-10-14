@@ -83,8 +83,8 @@ fn bench_iter(c: &mut Criterion) {
         let mut query = Query::<(&mut Position, &Velocity)>::new().unwrap();
         g.bench_function(BenchmarkId::new(format!("query_{tables}_tables"), N), |b| {
             b.iter(|| {
-                for (p, v) in query.iter_mut(&mut world).unwrap() {
-                    step(p, v);
+                for (mut p, v) in query.iter_mut(&mut world).unwrap() {
+                    step(&mut p, v);
                 }
             });
         });
@@ -93,7 +93,9 @@ fn bench_iter(c: &mut Criterion) {
             |b| {
                 b.iter(|| {
                     query
-                        .par_for_each_mut(&mut world, &pool, Grain::Auto, |(p, v)| step(p, v))
+                        .par_for_each_mut(&mut world, &pool, Grain::Auto, |(mut p, v)| {
+                            step(&mut p, v)
+                        })
                         .unwrap();
                 });
             },

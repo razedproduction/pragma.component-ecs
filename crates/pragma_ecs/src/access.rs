@@ -5,8 +5,9 @@ use std::fmt;
 
 use pragma_core::graph::TaskConfig;
 
+use crate::event::EventType;
 use crate::lend::{Columns, Lender};
-use crate::{Component, EcsError, Resource};
+use crate::{Component, EcsError, Event, Resource};
 
 /// How a query or a system uses a component or resource type.
 ///
@@ -81,6 +82,8 @@ pub struct Access {
     components: Vec<Entry>,
     /// Sorted by type id, one entry per type.
     resources: Vec<Entry>,
+    /// The event types the schedule must create and update, sorted by type id.
+    events: Vec<EventType>,
 }
 
 impl fmt::Debug for Access {
@@ -111,6 +114,7 @@ impl Access {
         Self {
             components: Vec::new(),
             resources: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -198,6 +202,56 @@ impl Access {
             Some(component) => Err(EcsError::ConflictingAccess { component }),
             None => Ok(()),
         }
+    }
+
+    /// Records that a row filter ([`Added`](crate::Added), [`Changed`](crate::Changed)) reads the
+    /// component type `T`: merged into any use of `T` already recorded by the same query
+    /// (DECISIONS #28), a read otherwise.
+    pub(crate) fn add_filter_read<T: Component>(&mut self) -> Result<(), EcsError> {
+        if find(&self.components, TypeId::of::<T>()).is_some() {
+            return Ok(());
+        }
+        self.add_component::<T>(AccessKind::Read)
+    }
+
+    /// Adds every entry of `other` with the strict rules: a write together with any other use
+    /// of the same type is a conflict (DECISIONS #17).
+    pub(crate) fn merge(&mut self, other: &Self) -> Result<(), EcsError> {
+        for entry in &other.components {
+            if let Some(component) = add(&mut self.components, *entry)? {
+                return Err(EcsError::ConflictingAccess { component });
+            }
+        }
+        for entry in &other.resources {
+            if let Some(resource) = add(&mut self.resources, *entry)? {
+                return Err(EcsError::ConflictingResourceAccess { resource });
+            }
+        }
+        for event in &other.events {
+            self.add_event_entry(*event)?;
+        }
+        Ok(())
+    }
+
+    /// Records that the event type `T` is written or read through the schedule's event
+    /// machinery (DECISIONS #26). Declares no access by itself.
+    pub(crate) fn add_event<T: Event>(&mut self) -> Result<(), EcsError> {
+        self.add_event_entry(EventType::of::<T>())
+    }
+
+    fn add_event_entry(&mut self, event: EventType) -> Result<(), EcsError> {
+        if let Err(i) = self.events.binary_search_by(|e| e.ty.cmp(&event.ty)) {
+            self.events
+                .try_reserve(1)
+                .map_err(|_| EcsError::OutOfMemory { entities: 0 })?;
+            self.events.insert(i, event);
+        }
+        Ok(())
+    }
+
+    /// The event types used.
+    pub(crate) fn events(&self) -> impl Iterator<Item = EventType> + '_ {
+        self.events.iter().copied()
     }
 
     /// Records that the resource type `T` is used with `kind`; a write together with any other

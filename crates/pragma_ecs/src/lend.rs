@@ -1,25 +1,27 @@
 //! Lending the world's columns to the frame graph for one frame (DECISIONS #18).
 //!
-//! Before a frame, the `Vec<T>` of every table that has a component type `T` some system uses is
-//! swapped with an empty `Vec` kept in the graph resource [`Columns<T>`] (one slot per table).
-//! Systems borrow `Columns<T>` through the graph's per-resource lock, so systems with disjoint
-//! component access run in parallel without `unsafe`. After the frame the same swap puts every
-//! column back. Swapping moves three words per column and never allocates; the slots grow
-//! (`try_reserve`) only when new tables appear, before anything is swapped.
+//! Before a frame, the column of every table that has a component type `T` some system uses
+//! (its values and their change ticks) is swapped with an empty one kept in the graph resource
+//! [`Columns<T>`] (one slot per table). Systems borrow `Columns<T>` through the graph's
+//! per-resource lock, so systems with disjoint component access run in parallel without
+//! `unsafe`. After the frame the same swap puts every column back. Swapping moves six words per
+//! column and never allocates; the slots grow (`try_reserve`) only when new tables appear, before
+//! anything is swapped.
 
 use std::any::TypeId;
 use std::fmt;
 use std::mem;
 
+use crate::component::ColumnData;
 use crate::{Component, EcsError, World};
 
 /// The columns of the component type `T` lent to the frame graph for one frame: the slot of a
-/// table is indexed by its archetype id, and tables without `T` keep an empty `Vec`.
+/// table is indexed by its archetype id, and tables without `T` keep an empty column.
 ///
 /// Internal to the schedule; visible only because query machinery names it.
 #[doc(hidden)]
 pub struct Columns<T> {
-    tables: Vec<Vec<T>>,
+    tables: Vec<ColumnData<T>>,
 }
 
 impl<T> fmt::Debug for Columns<T> {
@@ -31,11 +33,11 @@ impl<T> fmt::Debug for Columns<T> {
 }
 
 impl<T> Columns<T> {
-    pub(crate) fn tables(&self) -> &[Vec<T>] {
+    pub(crate) fn tables(&self) -> &[ColumnData<T>] {
         &self.tables
     }
 
-    pub(crate) fn tables_mut(&mut self) -> &mut [Vec<T>] {
+    pub(crate) fn tables_mut(&mut self) -> &mut [ColumnData<T>] {
         &mut self.tables
     }
 }
@@ -99,7 +101,9 @@ fn prepare<T: Component>(world: &mut World) -> Result<(), EcsError> {
             .tables
             .try_reserve(missing)
             .map_err(|_| EcsError::OutOfMemory { entities })?;
-        columns.tables.resize_with(tables.len(), Vec::new);
+        columns
+            .tables
+            .resize_with(tables.len(), ColumnData::default);
     }
     Ok(())
 }
@@ -133,7 +137,7 @@ mod tests {
         lender.swap(&mut world);
         assert!(world.get::<Position>(e).is_none(), "the column is lent");
         let lent = world.lend_parts().1.get_mut::<Columns<Position>>().unwrap();
-        assert_eq!(lent.tables().iter().map(Vec::len).sum::<usize>(), 1);
+        assert_eq!(lent.tables().iter().map(ColumnData::len).sum::<usize>(), 1);
         assert!(format!("{lent:?}").starts_with("Columns"));
 
         lender.swap(&mut world);

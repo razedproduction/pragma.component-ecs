@@ -1,15 +1,18 @@
 //! An Entity Component System for game engines and frameworks built on
 //! [`pragma_core`](https://docs.rs/pragma_core).
 //!
-//! The crate is at milestone M3: entities, component storage, queries and systems. A [`World`]
-//! holds entities ([`Entity`], generational ids), their components (any `Send + Sync + 'static`
-//! type, see [`Component`]) in archetype tables, and resources (singletons, see [`Resource`]).
-//! A [`Query`] iterates the entities that have the components it asks for, sequentially or in
-//! parallel on the `pragma_core` thread pool, and declares which component types it reads and
-//! writes ([`Access`]). Systems are plain functions of [`View`], [`Res`] and [`ResMut`]
-//! parameters; a [`Schedule`] runs them as tasks of the `pragma_core` frame graph, in parallel
-//! where their accesses allow, and rejects conflicting systems without an explicit order when it
-//! is built. See `docs/roadmap.md` and `docs/architecture.md`.
+//! The crate is at milestone M4: entities, component storage, queries, systems, commands,
+//! events and change detection. A [`World`] holds entities ([`Entity`], generational ids), their
+//! components (any `Send + Sync + 'static` type, see [`Component`]) in archetype tables, and
+//! resources (singletons, see [`Resource`]). A [`Query`] iterates the entities that have the
+//! components it asks for, sequentially or in parallel on the `pragma_core` thread pool, and
+//! declares which component types it reads and writes ([`Access`]); `&mut T` yields a [`Mut<T>`]
+//! that records changes for the [`Added`] / [`Changed`] filters. Systems are plain functions of
+//! [`View`], [`Res`], [`ResMut`], [`Commands`], [`EventWriter`] and [`EventReader`] parameters;
+//! a [`Schedule`] runs them as tasks of the `pragma_core` frame graph, in parallel where their
+//! accesses allow, rejects conflicting systems without an explicit order when it is built, and
+//! applies deferred commands and events at the end of every frame in a fixed order. See
+//! `docs/roadmap.md` and `docs/architecture.md`.
 //!
 //! ```
 //! use pragma_core::prelude::{PoolConfig, ThreadPool};
@@ -20,7 +23,7 @@
 //! struct Dt(f32);
 //!
 //! fn movement(mut bodies: View<(&mut Position, &Velocity)>, dt: Res<Dt>) -> Result<(), EcsError> {
-//!     for (position, velocity) in bodies.iter_mut()? {
+//!     for (mut position, velocity) in bodies.iter_mut()? {
 //!         position.0 += velocity.0 * dt.0;
 //!         position.1 += velocity.1 * dt.0;
 //!     }
@@ -48,9 +51,12 @@
 
 mod access;
 mod archetype;
+mod change;
+mod command;
 mod component;
 mod entity;
 mod error;
+mod event;
 mod fetch;
 mod lend;
 mod query;
@@ -60,10 +66,13 @@ mod system;
 mod world;
 
 pub use access::{Access, AccessKind};
+pub use change::Mut;
+pub use command::{Commands, EntityCommands};
 pub use component::Component;
 pub use entity::Entity;
 pub use error::EcsError;
-pub use fetch::{QueryData, QueryFilter, ReadOnlyQueryData, With, Without};
+pub use event::{Event, EventCursor, EventIter, EventReader, EventWriter, Events};
+pub use fetch::{Added, Changed, QueryData, QueryFilter, ReadOnlyQueryData, With, Without};
 pub use query::{Query, QueryIter, QueryIterMut};
 pub use resource::{Res, ResMut, Resource};
 pub use schedule::{Schedule, ScheduleBuilder, SystemConfig};

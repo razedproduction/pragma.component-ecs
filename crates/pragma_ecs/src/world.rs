@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pragma_core::graph::Resources;
 
 use crate::archetype::{Archetype, two_mut};
-use crate::component::{Column, Component};
+use crate::component::{Column, ColumnData, Component};
 use crate::entity::{Entities, Location};
-use crate::{EcsError, Entity, Res, Resource};
+use crate::{EcsError, Entity, Event, Events, Res, Resource};
 
 /// The archetype of entities without components; it is always the first one created.
 const EMPTY: usize = 0;
@@ -63,6 +63,10 @@ pub struct World {
     by_types: HashMap<Vec<TypeId>, usize>,
     /// The resources, and the slots a schedule lends the columns through (DECISIONS #18, #20).
     resources: Resources,
+    /// The last change tick taken (DECISIONS #27).
+    tick: u64,
+    /// The tick of the first system of the running frame.
+    frame_base: u64,
 }
 
 impl Default for World {
@@ -90,7 +94,82 @@ impl World {
             archetypes: Vec::new(),
             by_types: HashMap::new(),
             resources: Resources::new(),
+            tick: 0,
+            frame_base: 0,
         }
+    }
+
+    /// The world's change tick: the tick of the most recent change (DECISIONS #27).
+    ///
+    /// Every mutating operation (`insert`, `get_mut`, a mutable query, a frame of a
+    /// [`Schedule`](crate::Schedule)) takes newer ticks; a component's added and changed ticks
+    /// are compared with the tick at which a query or a system last ran to answer
+    /// [`Added<T>`](crate::Added) and [`Changed<T>`](crate::Changed).
+    ///
+    /// ```
+    /// use pragma_ecs::World;
+    ///
+    /// let mut world = World::new();
+    /// assert_eq!(world.change_tick(), 0);
+    /// let entity = world.spawn()?;
+    /// world.insert(entity, 1_u8)?;
+    /// let before = world.change_tick();
+    /// let _ = world.get_mut::<u8>(entity);
+    /// assert!(world.change_tick() > before);
+    /// # Ok::<(), pragma_ecs::EcsError>(())
+    /// ```
+    #[must_use]
+    pub const fn change_tick(&self) -> u64 {
+        self.tick
+    }
+
+    /// Sends `event` to the [`Events<T>`] resource, creating it if the world has none. Readers
+    /// see it from the next frame on (DECISIONS #26).
+    ///
+    /// ```
+    /// use pragma_ecs::{EventCursor, Events, World};
+    ///
+    /// struct Explosion(u32);
+    ///
+    /// let mut world = World::new();
+    /// world.send_event(Explosion(3))?;
+    /// let mut cursor = EventCursor::<Explosion>::default();
+    /// let events = world.resource::<Events<Explosion>>().ok_or("no events")?;
+    /// assert_eq!(cursor.read(&events).map(|e| e.0).collect::<Vec<_>>(), [3]);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`EcsError::OutOfMemory`] if the event buffer cannot grow; the event is dropped.
+    pub fn send_event<T: Event>(&mut self, event: T) -> Result<(), EcsError> {
+        if !self.resources.contains::<Events<T>>() {
+            self.resources.insert(Events::<T>::default());
+        }
+        match self.resources.get_mut::<Events<T>>() {
+            Some(events) => events.send(event),
+            None => Ok(()),
+        }
+    }
+
+    /// Takes a new change tick for one mutating operation.
+    pub(crate) fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.saturating_add(1);
+        self.tick
+    }
+
+    /// Takes `count` consecutive ticks for the systems of a frame and returns the first one.
+    pub(crate) fn begin_frame(&mut self, count: usize) -> u64 {
+        let base = self.tick.saturating_add(1);
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        self.tick = base.saturating_add(count);
+        self.frame_base = base;
+        base
+    }
+
+    /// The tick of the first system of the frame running over this world.
+    pub(crate) const fn frame_base(&self) -> u64 {
+        self.frame_base
     }
 
     /// Number of live entities.
@@ -173,7 +252,8 @@ impl World {
     /// Attaches `value` to `entity`, or replaces the component of that type it already has.
     ///
     /// Returns the replaced component, if any. Adding a new component type moves the entity to
-    /// another archetype table.
+    /// another archetype table. A new component counts as added and changed, a replaced one as
+    /// changed (DECISIONS #28).
     ///
     /// ```
     /// use pragma_ecs::World;
@@ -197,11 +277,12 @@ impl World {
     ) -> Result<Option<T>, EcsError> {
         let missing = || EcsError::NoSuchEntity { entity };
         let from = self.entities.location(entity).ok_or_else(missing)?;
+        let tick = self.next_tick();
         let source = self
             .archetypes
             .get_mut(from.archetype)
             .ok_or_else(missing)?;
-        if let Some(slot) = source.get_mut::<T>(from.row) {
+        if let Some(slot) = source.get_mut::<T>(from.row, tick) {
             return Ok(Some(std::mem::replace(slot, value)));
         }
 
@@ -215,7 +296,7 @@ impl World {
             left_behind = left_behind.saturating_add(1);
         });
         debug_assert_eq!(left_behind, 0, "the target has every source column");
-        let pushed = dest.push_component(value);
+        let pushed = dest.push_component(value, tick);
         debug_assert!(pushed, "the target has a column of the inserted type");
         let row = dest.push_entity(entity);
         let swapped = source.swap_remove_entity(from.row);
@@ -262,13 +343,15 @@ impl World {
         let row = from.row;
         let mut taken = None;
         source.move_row(row, dest, |_, column| {
-            let removed_type = column.as_any().is::<Vec<T>>();
+            let removed_type = column.as_any().is::<ColumnData<T>>();
             debug_assert!(
                 removed_type,
                 "only the column of the removed type is left behind"
             );
-            match column.as_any_mut().downcast_mut::<Vec<T>>() {
-                Some(values) if row < values.len() => taken = Some(values.swap_remove(row)),
+            match column.as_any_mut().downcast_mut::<ColumnData<T>>() {
+                Some(values) if row < values.len() => {
+                    taken = values.swap_remove(row).map(|(value, _, _)| value);
+                }
                 // Unreachable; keeps the columns aligned anyway.
                 _ => {
                     column.swap_remove_drop(row);
@@ -325,12 +408,16 @@ impl World {
     /// assert_eq!(world.get::<u32>(entity), Some(&8));
     /// # Ok::<(), pragma_ecs::EcsError>(())
     /// ```
+    ///
+    /// The component counts as changed (DECISIONS #28): [`Changed<T>`](crate::Changed) sees it
+    /// whether or not it is actually written.
     #[must_use]
     pub fn get_mut<T: Component>(&mut self, entity: Entity) -> Option<&mut T> {
         let location = self.entities.location(entity)?;
+        let tick = self.next_tick();
         self.archetypes
             .get_mut(location.archetype)?
-            .get_mut::<T>(location.row)
+            .get_mut::<T>(location.row, tick)
     }
 
     /// Stores the resource `value`; returns the previous resource of this type, if any.
@@ -530,7 +617,7 @@ impl World {
 }
 
 fn new_column<T: Component>() -> Box<dyn Column> {
-    Box::new(Vec::<T>::new())
+    Box::new(ColumnData::<T>::default())
 }
 
 #[cfg(test)]
