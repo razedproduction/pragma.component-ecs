@@ -8,8 +8,9 @@
 //! - `despawn`: despawn 10 000 entities.
 //!
 //! The libraries differ in what they do per write: `pragma_ecs` and `bevy_ecs` stamp a change
-//! tick (`u64` / `u32`), `hecs` has no change detection. `pragma_ecs` has no bundle spawn, so a
-//! spawn is `spawn` plus one `insert` per component (each a table move).
+//! tick (`u64` / `u32`), `hecs` has no change detection. Every library spawns a bundle into its
+//! final table (`pragma_ecs` since 1.0, DECISIONS #35); `spawn/pragma_ecs_inserts` keeps the
+//! pre-bundle way, `spawn` plus one `insert` per component (each a table move).
 //!
 //! `cargo bench --manifest-path baseline/Cargo.toml` (report:
 //! `baseline/target/criterion/report/index.html`).
@@ -53,14 +54,20 @@ const VELOCITY: Velocity = Velocity([1.0, 2.0, 3.0]);
 fn pragma_world(n: usize) -> (pragma_ecs::World, Vec<pragma_ecs::Entity>) {
     let mut world = pragma_ecs::World::new();
     let entities = (0..n)
-        .map(|i| {
-            let e = world.spawn().unwrap();
-            world.insert(e, position(i)).unwrap();
-            world.insert(e, VELOCITY).unwrap();
-            e
-        })
+        .map(|i| world.spawn_bundle((position(i), VELOCITY)).unwrap())
         .collect();
     (world, entities)
+}
+
+/// The same world without bundles: `spawn` plus one `insert` (a table move) per component.
+fn pragma_world_inserts(n: usize) -> pragma_ecs::World {
+    let mut world = pragma_ecs::World::new();
+    for i in 0..n {
+        let e = world.spawn().unwrap();
+        world.insert(e, position(i)).unwrap();
+        world.insert(e, VELOCITY).unwrap();
+    }
+    world
 }
 
 fn hecs_world(n: usize) -> (hecs::World, Vec<hecs::Entity>) {
@@ -83,6 +90,9 @@ fn spawn(c: &mut Criterion) {
     let mut g = c.benchmark_group("spawn");
     g.throughput(Throughput::Elements(SPAWN as u64));
     g.bench_function("pragma_ecs", |b| b.iter(|| pragma_world(SPAWN)));
+    g.bench_function("pragma_ecs_inserts", |b| {
+        b.iter(|| pragma_world_inserts(SPAWN));
+    });
     g.bench_function("hecs", |b| b.iter(|| hecs_world(SPAWN)));
     g.bench_function("bevy_ecs", |b| b.iter(|| bevy_world(SPAWN)));
     g.finish();
@@ -158,9 +168,7 @@ fn frag_iter(c: &mut Criterion) {
     macro_rules! spawn_pragma {
         ($($marker:ident),*) => {$(
             for _ in 0..FRAG_PER_TABLE {
-                let e = world.spawn().unwrap();
-                world.insert(e, Data(1.0)).unwrap();
-                world.insert(e, $marker).unwrap();
+                world.spawn_bundle((Data(1.0), $marker)).unwrap();
             }
         )*};
     }

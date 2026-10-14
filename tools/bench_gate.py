@@ -55,6 +55,7 @@ REFERENCES = {
     "query_iter/query_parallel_8_tables/100000": "query_iter/vec_parallel/100000",
     "schedule_frame/schedule/100000": "schedule_frame/queries/100000",
     "commands/spawn_commands/10000": "commands/spawn_direct/10000",
+    "commands/spawn_bundle_commands/10000": "commands/spawn_bundle_direct/10000",
     "commands/despawn_commands/10000": "commands/despawn_direct/10000",
     "change/read_changed_none/100000": "change/read_plain/100000",
     "change/read_changed_10_percent/100000": "change/read_plain/100000",
