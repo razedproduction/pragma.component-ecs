@@ -13,8 +13,23 @@ caught when the schedule is built, not as a data race at run time.
 
 ## Status
 
-**M0 — repository foundation.** There is no public API yet. See the [roadmap](docs/roadmap.md)
-and the [intended architecture](docs/architecture.md).
+**M1 — entities and component storage.** A `World` of generational `Entity` ids and components in
+archetype tables (`spawn`, `despawn`, `insert`, `remove`, `get`, `get_mut`); queries and systems
+come next. See the [roadmap](docs/roadmap.md) and the [architecture](docs/architecture.md).
+
+```rust
+use pragma_ecs::World;
+
+struct Position(f32, f32);
+
+let mut world = World::new();
+let entity = world.spawn()?;
+world.insert(entity, Position(0.0, 0.0))?;
+if let Some(position) = world.get_mut::<Position>(entity) {
+    position.0 += 1.0;
+}
+world.despawn(entity)?;
+```
 
 ## Building
 
@@ -32,7 +47,10 @@ The same rules as pragma.core, checked in CI on every PR:
 - **Pure Rust.** No C/C++ compiled into the dependency tree (`cargo deny`, `tools/audit_workspace.py`).
 - **No panics in the library.** `unwrap`/`expect`/`panic!`/unchecked indexing are denied by lints;
   failures are typed `#[non_exhaustive]` errors.
-- **No `unsafe`** until a decision record allows it in a specific crate ([DECISIONS #6](DECISIONS.md)).
+- **No `unsafe`** in the library, storage included ([DECISIONS #6, #9](DECISIONS.md)); the only
+  `unsafe` is a failing test allocator, counted in the `layers.toml` budget (#11).
+- **Bounded allocations.** Storage grows through `try_reserve`; out of memory is
+  `EcsError::OutOfMemory` with the world unchanged, not an abort.
 - **Layered.** Crates depend only on lower layers (`layers.toml`).
 
 ## Platforms
