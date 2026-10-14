@@ -1,0 +1,13 @@
+# pragma.component-ecs decisions
+
+ADR log. A decision changes only through a new entry with a reason (the old one is not deleted, it is marked "superseded by #N").
+
+| # | Decision | Choice | Why | Date |
+|---|---------|-------|--------|------|
+| 1 | Component boundaries | An ECS: entities, components, storage, queries, systems, resources, commands, events. **No** rendering, windowing, input, asset loading, App/plugin framework, game loop | pragma.core DECISIONS #1 leaves the ECS to a layer above the core; the frame loop and the rest of the engine belong to a specific engine and must stay replaceable | 2026-10-14 |
+| 2 | Relation to pragma.core | Depends on the `pragma_core` facade (1.x from crates.io) with `default-features = false`, enabling only what it uses (`jobs`, `graph`). No own thread pool or scheduler: systems become tasks of the pragma.core frame graph, parallel iteration goes through `ThreadPool::parallel_for` | One pool per process; the frame graph already validates resource conflicts at build time, which is exactly what system scheduling needs. The facade, not individual crates, per pragma.core's versioning policy | 2026-10-14 |
+| 3 | Platforms and toolchain | The same as pragma.core: Windows and Linux (x86_64) in CI; edition 2024, MSRV 1.88, pinned 1.99.0 | The component ships together with the core; diverging toolchains would only add friction | 2026-10-14 |
+| 4 | Workspace and versions | A Cargo workspace (`crates/*`), one crate `pragma_ecs` for now; all crates share one version (lockstep), internal dependencies `=X.Y.Z`. Starting at 0.0.1, `publish = false` until the API review | The same policy as pragma.core #33/#42; splitting into crates happens when a layer boundary appears, not in advance | 2026-10-14 |
+| 5 | Dependency purity | Pure Rust only, checked by `cargo deny` and `tools/audit_workspace.py` (copied from pragma.core). `generator` (via `pragma_sync` → `loom`, only under `cfg(loom)`) is accepted in `[purity.accepted]` | The same rule as pragma.core #4; the `loom` path is inherited from pragma.core #7/#12 and never reaches users' binaries | 2026-10-14 |
+| 6 | `unsafe` policy | `#![forbid(unsafe_code)]` in every crate at the start; `unsafe_allowed` is empty. Type-erased component storage will likely need `unsafe`: it is introduced by a separate decision, in a dedicated crate, with a budget in `layers.toml`, `// SAFETY:` on every block and Miri in CI | Confines the risk, as pragma.core #6/#27 did; the need is decided when the storage design (roadmap M1) is chosen, not in advance | 2026-10-14 |
+| 7 | Documentation language | English everywhere: README, `docs/`, this log, rustdoc, comments | The same as pragma.core #43 | 2026-10-14 |

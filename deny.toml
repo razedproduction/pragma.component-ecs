@@ -1,0 +1,46 @@
+# cargo-deny: licenses, advisories, a ban on bundled C/C++.
+# Run: cargo deny check
+
+[graph]
+all-features = true
+# Supported platforms: the same as pragma.core (DECISIONS.md #3).
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+# Dev dependencies never reach users' binaries.
+exclude-dev = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { crate = "cc", reason = "pragma.component-ecs is pure Rust: no C/C++ compiled into the tree" },
+    { crate = "cmake", reason = "pure Rust policy" },
+    { crate = "bindgen", reason = "pure Rust policy" },
+    { crate = "openssl-sys", reason = "vendored C" },
+    { crate = "ring", reason = "embedded C/asm" },
+    { crate = "aws-lc-sys", reason = "vendored C" },
+    { crate = "zstd-sys", reason = "vendored C; use ruzstd" },
+    { crate = "libz-sys", reason = "vendored C; use miniz_oxide" },
+    { crate = "tracy-client-sys", reason = "C++; allowed only behind an explicit feature + DECISIONS.md entry" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -1,0 +1,21 @@
+# Workspace layers. A crate may depend only on crates of a strictly lower layer.
+# Exceptions go into [allow], each with an entry in DECISIONS.md.
+# Checked by: python tools/audit_workspace.py .
+#
+# pragma.core itself (`pragma_core` from crates.io) sits below every layer here.
+
+# Crates where unsafe is allowed. Empty until a decision record says otherwise (DECISIONS.md #6).
+unsafe_allowed = []
+
+[crates]
+pragma_ecs = 0   # entities, components, storage, queries, systems on the pragma.core frame graph
+
+[allow]
+
+# The `unsafe` budget: the exact number of occurrences of the keyword in a file's code and the
+# decisions that allowed them. Growth only with a new entry in DECISIONS.md.
+[unsafe_budget]
+
+# Deliberately accepted exceptions to the "no C/C++" rule.
+[purity.accepted]
+generator = "via pragma_core -> pragma_sync -> loom, only under cfg(loom) (pragma.core DECISIONS #7, #12); never reaches users' binaries (DECISIONS.md #5)"

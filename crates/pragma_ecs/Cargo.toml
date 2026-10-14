@@ -1,0 +1,24 @@
+[package]
+name = "pragma_ecs"
+description = "Entity Component System for pragma.core-based game engines and frameworks, in pure Rust"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Not published until the API is reviewed (docs/roadmap.md, M6).
+publish = false
+
+[dependencies]
+pragma_core = { workspace = true, features = ["jobs", "graph"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Claude Code worktrees
+.claude/worktrees/
