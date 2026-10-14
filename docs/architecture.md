@@ -1,9 +1,9 @@
 # Architecture
 
-Status: §2–3 are **implemented** (M1), queries in §4 too (M2), systems, resources and
-schedules (M3), and commands, events and change detection (§4, M4), and the hardening tools of M5
-(§6); the rest is the **intended design**. Sections marked *open* are decided in the
-milestone named there and recorded in `DECISIONS.md`.
+Status: everything here is **implemented** as of 1.0.0 (M6): entities and storage (§2–3, M1,
+bundles M6), queries, systems, resources and schedules (§4, M2–M3), commands, events and change
+detection (§4, M4) and the hardening tools (§6, M5). The reasons are in `DECISIONS.md`; how an
+engine wires the pieces together is "Integrating into an engine" in the crate docs.
 
 ## 1. Place in the stack
 
@@ -38,7 +38,9 @@ World
 │                                  plus a Vec<ComponentTicks> (added, changed: u64, M4)
 │     entities: [Entity]          row → entity, parallel to every column
 │     add/remove edges            TypeId → neighbouring archetype (cache)
+│     bundle edges                bundle TypeId → archetype with the bundle's types (M6)
 └── by_types: HashMap<[TypeId], archetype id>
+    (every map keyed by TypeIds uses a multiplicative hasher, not SipHash: DECISIONS #35)
 ```
 
 - **Tables.** Entities with the same component set share an archetype. A component lives at
@@ -58,8 +60,18 @@ World
   #9); the trait has the operations a table needs without knowing `T` (an empty clone, reserve,
   `swap_remove` with drop, `swap_remove` into another column of the same type). Iteration (M2)
   downcasts each column once per table and then works on plain slices.
+- **Bundles (M6, DECISIONS #35).** A `Bundle` is a tuple of 0–12 components. `spawn_bundle`
+  looks up the target table through the empty table's bundle edge (on a miss: the bundle's
+  types are sorted, checked for duplicates — `EcsError::DuplicateComponent` — and merged with
+  the source table's, the table is found in `by_types` or created), reserves one row, allocates
+  the id and writes each component into its column; `insert_bundle` does the same from the
+  entity's table, moving the row once and replacing the components it already had in place.
+  Deferred bundles (`Commands::spawn_bundle` / `insert_bundle`) wait in a typed lane of their
+  own and apply the same operations at the sync point. Ids and row order are the same as with
+  `spawn` + `insert`s, and so is the relative order of the final tables.
 - **Components.** `Component` is implemented for every `Send + Sync + 'static` type; zero-sized
-  components cost no memory (`Vec<ZST>`).
+  components cost no memory (`Vec<ZST>`). A tuple is a component too, which is why bundles have
+  their own methods instead of `insert` taking a bundle.
 
 Not chosen for now: sparse sets (cheap add/remove, but multi-component iteration needs a join) and
 a hybrid (sparse sets opt-in per type). A hybrid can be added later without changing the `World`

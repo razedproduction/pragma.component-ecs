@@ -80,7 +80,7 @@ jobs:
           for path in sorted(root.glob("*/*/new/estimates.json")):
               group, lib = path.parts[-4], path.parts[-3]
               rows.setdefault(group, {})[lib] = json.loads(path.read_text())["median"]["point_estimate"]
-          libs = ["pragma_ecs", "hecs", "bevy_ecs", "vec"]
+          libs = ["pragma_ecs", "pragma_ecs_inserts", "hecs", "bevy_ecs", "vec"]
           lines = ["### Baseline (median, µs)", "", "| workload | " + " | ".join(libs) + " |",
                    "|---" * (len(libs) + 1) + "|"]
           for group, values in rows.items():

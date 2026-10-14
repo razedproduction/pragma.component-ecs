@@ -4,7 +4,27 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ## [Unreleased]
 
+The first crates.io release will be **1.0.0** (M6, DECISIONS #39): it contains everything below
+since 0.1.0. Tagging and publishing are done by the owner.
+
 ### Added
+
+- Bundles (M6, DECISIONS #35): the sealed trait `Bundle`, implemented for tuples of 0 to 12
+  components; `World::spawn_bundle` (an entity created directly in its final table) and
+  `World::insert_bundle` (one table move; components of the same types are replaced),
+  `Commands::spawn_bundle` (returns `EntityCommands`), `Commands::insert_bundle` and
+  `EntityCommands::insert_bundle`; the new error `EcsError::DuplicateComponent` for a bundle
+  with a type twice. Spawning 10 000 entities with two components: about 1.5 ms instead of
+  2.4 ms with `spawn` + `insert` (`baseline/`).
+- `pub use pragma_core`: the `pragma_core` the crate is built with (#36).
+- Crate documentation (#36, #38): an overview, the semver guarantees (items hidden from the
+  documentation and the hidden methods of sealed traits are not covered) and an "Integrating
+  into an engine" section with a compiled engine skeleton; rustdoc examples on the main methods
+  (`World::spawn` / `despawn`, `Commands`, `EntityCommands`, `ScheduleBuilder::add_system` /
+  `build`).
+- Tests: bundles in the world, command and change-tick oracles (shared with the fuzz targets),
+  bundles without memory (`tests/oom.rs`). Benchmarks `commands/spawn_bundle_direct` and
+  `spawn_bundle_commands` (gated), `spawn/pragma_ecs_inserts` in the baseline.
 
 - Hardening (M5, DECISIONS #29–#33):
   - the determinism suite `ecs_sim --suite [--bless] [--golden FILE]`: seven scenarios
@@ -92,7 +112,15 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ### Changed
 
-- The workspace version is 0.5.0 (DECISIONS #33; not released yet, the last tag is v0.1.0).
+- The workspace version is 1.0.0 and `pragma_ecs` is publishable (`publish = false` removed),
+  with its own README and LICENSE in the package and `documentation` pointing to docs.rs
+  (DECISIONS #39). 1.0.0 only adds to the API of 0.5.0 (`cargo semver-checks` as a minor
+  release passes). `ecs_sim`, `fuzz/` and `baseline/` stay unpublished.
+- Faster table lookups: the maps keyed by `TypeId`s use a multiplicative hasher instead of
+  SipHash (add/remove of a component about 14 % faster, #35). The per-row path of
+  `QueryIter`, `QueryIterMut` and `ViewIter` is inlined (#37).
+- `examples/ecs_sim` spawns through bundles; its golden hashes are unchanged.
+- The workspace version was 0.5.0 in M5 (DECISIONS #33; never released, the last tag is v0.1.0).
 - **Breaking:** `&mut T` in a `Query` or a `View` yields `Mut<'_, T>` instead of `&mut T`
   (DECISIONS #28); field access and methods work through auto-deref, a function taking `&mut T`
   needs `&mut *item`. `World::get_mut` and replacing a component with `World::insert` mark it
