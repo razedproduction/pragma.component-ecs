@@ -6,6 +6,33 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ### Added
 
+- Deferred commands (M4, DECISIONS #23–#25): the system parameter `Commands` (`spawn`,
+  `entity`, `despawn`, `insert`, `remove`, `len`, `is_empty`) and `EntityCommands` (`id`,
+  `insert`, `remove`, `despawn`, chaining). Commands are kept per system, declare no access, and
+  are applied at the sync point at the end of `Schedule::run`, system after system in
+  registration order, so the world and its entity ids are the same on any number of workers;
+  a new entity gets its id only then. A command on a dead entity is a no-op; any other failure
+  while applying is the new `EcsError::CommandFailed { system, source }` (the rest is
+  discarded); the commands of a failed or panicked system are discarded.
+- Events (#26): `Event` (blanket over `Send + Sync + 'static`), the double-buffered resource
+  `Events<T>` (`new`, `send`, `update`, `len`, `is_empty`, `iter`), `EventCursor` (`read`,
+  `unread`), `EventIter`, the system parameters `EventWriter<T>` (published at the sync point, no
+  access) and `EventReader<T>` (a read of `Events<T>`, a cursor per system), and
+  `World::send_event`. A schedule creates and updates `Events<T>` for every event type its
+  systems use.
+- Change detection (#27, #28): `u64` added / changed ticks per component, stored next to the
+  values; `World::change_tick`; the wrapper `Mut<T>` (`Deref`, `DerefMut`, `AsRef`, `AsMut`,
+  `into_inner`) that marks a component changed when written; the row filters `Added<T>` and
+  `Changed<T>`, also with `&mut T` of the same type in one query. A system's ticks follow the
+  schedule's topological order, so change detection is deterministic too.
+- `examples/ecs_sim` now despawns and respawns dying entities through commands and a `Death`
+  event, counts critical health changes (`Changed<Health>`) and births (`Added<Age>`); its
+  report has `births` and `alive`.
+- Tests: commands against direct world operations on 1 and 4 workers (`tests/commands.rs`),
+  events (`tests/events.rs`), change filters against a per-entity tick oracle and through
+  schedules in both orders (`tests/change.rs`), command application without memory
+  (`tests/oom.rs`). Benchmarks `benches/commands.rs` and `benches/change.rs`.
+
 - Systems and schedules (M3): systems are plain functions of up to 8 parameters — `View<Q, F>`
   (a query over the frame's world, with `iter`, `iter_mut`, `par_for_each`, `par_for_each_mut`
   and the iterator `ViewIter`), `Res<T>`, `ResMut<T>` (sealed `SystemParam`) — returning `()`
@@ -48,6 +75,14 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ### Changed
 
+- **Breaking:** `&mut T` in a `Query` or a `View` yields `Mut<'_, T>` instead of `&mut T`
+  (DECISIONS #28); field access and methods work through auto-deref, a function taking `&mut T`
+  needs `&mut *item`. `World::get_mut` and replacing a component with `World::insert` mark it
+  changed.
+- `QueryIter`, `QueryIterMut` and `ViewIter` take the query's filter as a type parameter
+  (defaulting to `()`); `QueryFilter` has row filters; `SystemParam` covers `Commands`,
+  `EventWriter` and `EventReader`.
+- `Schedule::run` ends with the sync point (event update, deferred commands and events).
 - `EcsError::OutOfMemory::entities` is documented for query allocations (the world's entity
   count, or 0 when building a query's access or a schedule).
 - `EcsError::Job` now also covers parallel views inside systems.

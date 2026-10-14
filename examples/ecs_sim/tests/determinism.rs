@@ -1,4 +1,4 @@
-//! The hash of every tick does not depend on the number of workers (DECISIONS #22).
+//! The hash of every tick does not depend on the number of workers (DECISIONS #22, #24, #27).
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use ecs_sim::{SimConfig, Verdict, compare, default_workers, run};
@@ -18,13 +18,20 @@ fn hashes_match_on_1_2_and_n_workers() {
 }
 
 #[test]
-fn the_simulation_changes_state_and_moves_entities_between_tables() {
+fn the_simulation_changes_state_and_replaces_the_dead_through_commands() {
     let report = run(&small()).unwrap();
     assert_eq!(report.hashes.len(), 150);
     // Every tick changes the state.
     assert!(report.hashes.windows(2).all(|w| w[0] != w[1]));
-    // Some entities died inside the hazard and moved to the `Dead` table, some did not.
+    // Some entities died inside the hazard, not all of them.
     assert!(report.dead > 0 && report.dead < 5_000, "{}", report.dead);
+    // Every death handled in a tick before the last spawned a replacement, which `census` saw
+    // as added; the dead were despawned, so the population stays the same.
+    assert!(
+        report.births > 0 && report.births <= report.dead,
+        "{report:?}"
+    );
+    assert_eq!(report.alive, 5_000);
     // Another seed gives another history.
     let other = run(&SimConfig { seed: 7, ..small() }).unwrap();
     assert_ne!(other.hashes, report.hashes);

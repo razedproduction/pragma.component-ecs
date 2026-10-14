@@ -1,5 +1,7 @@
 //! Growing the world without memory yields `EcsError::OutOfMemory` and leaves the world
 //! unchanged, not an `abort`; despawning, lookups and moves into tables with room do not allocate.
+//! Applying deferred commands without memory stops with `EcsError::CommandFailed`, keeping what
+//! was applied (DECISIONS #25).
 //!
 //! A separate test binary with a failing global allocator (DECISIONS.md #11).
 // Test code: a panic is a test failure.
@@ -9,18 +11,29 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use pragma_core::prelude::{PoolConfig, ThreadPool};
-use pragma_ecs::{EcsError, Query, Schedule, View, World};
+use pragma_ecs::{Commands, EcsError, Query, Res, Schedule, View, World};
 
-/// The system allocator, refusing every allocation on a thread that has `FAIL` raised.
+/// The system allocator, refusing every allocation on a thread that has `FAIL` raised, or the
+/// next `REFUSE` allocations on that thread.
 struct Failing;
 
 thread_local! {
     // Const initialization: accessing it from the allocator does not allocate by itself.
     static FAIL: Cell<bool> = const { Cell::new(false) };
+    static REFUSE: Cell<u32> = const { Cell::new(0) };
 }
 
 fn failing() -> bool {
-    FAIL.try_with(Cell::get).unwrap_or(false)
+    if FAIL.try_with(Cell::get).unwrap_or(false) {
+        return true;
+    }
+    REFUSE
+        .try_with(|refuse| {
+            let left = refuse.get();
+            refuse.set(left.saturating_sub(1));
+            left > 0
+        })
+        .unwrap_or(false)
 }
 
 // SAFETY: the methods delegate to `System` with the same arguments; failure means returning null,
@@ -56,6 +69,15 @@ fn without_memory<R>(f: impl FnOnce() -> R) -> R {
     FAIL.with(|fail| fail.set(true));
     let result = f();
     FAIL.with(|fail| fail.set(false));
+    result
+}
+
+/// Runs `f` while the allocator refuses the first allocation on this thread; later ones (for
+/// example the error's own message) succeed.
+fn refusing_once<R>(f: impl FnOnce() -> R) -> R {
+    REFUSE.with(|refuse| refuse.set(1));
+    let result = f();
+    REFUSE.with(|refuse| refuse.set(0));
     result
 }
 
@@ -131,7 +153,7 @@ fn queries_without_memory_fail_typed_and_a_warm_cache_does_not_allocate() {
     // Once the cache knows every table, iterating does not allocate.
     assert_eq!(query.iter_mut(&mut world).unwrap().count(), 1);
     without_memory(|| {
-        for (a, b) in query.iter_mut(&mut world).unwrap() {
+        for (mut a, b) in query.iter_mut(&mut world).unwrap() {
             a.0 += u32::try_from(b.0).unwrap();
         }
     });
@@ -139,7 +161,7 @@ fn queries_without_memory_fail_typed_and_a_warm_cache_does_not_allocate() {
 }
 
 fn add_b_to_a(mut rows: View<(&mut A, &B)>) -> Result<(), EcsError> {
-    for (a, b) in rows.iter_mut()? {
+    for (mut a, b) in rows.iter_mut()? {
         a.0 += u32::try_from(b.0).unwrap();
     }
     Ok(())
@@ -174,6 +196,59 @@ fn a_frame_without_memory_for_new_tables_lends_nothing() {
     schedule.run(&mut world, &pool).unwrap();
     assert_eq!(world.get::<A>(e), Some(&A(5)));
     assert_eq!(world.get::<A>(f), Some(&A(5)));
+}
+
+struct Phase(u8);
+
+#[test]
+fn commands_without_memory_stop_with_command_failed_and_keep_what_was_applied() {
+    let pool = ThreadPool::new(PoolConfig::default().with_workers(1)).unwrap();
+    let mut world = World::new();
+    let first = world.spawn().unwrap();
+    let second = world.spawn().unwrap();
+    let gone = world.spawn().unwrap();
+    world.despawn(gone).unwrap();
+    world.insert_resource(Phase(0));
+
+    let mut builder = Schedule::builder();
+    builder
+        .add_system(
+            "edit",
+            move |mut commands: Commands<'_>, phase: Res<Phase>| -> Result<(), EcsError> {
+                if phase.0 == 0 {
+                    // Warms the queue: a lane for `B` (on a dead entity: a no-op) and the {A} table.
+                    commands.insert(gone, B(0))?;
+                    commands.insert(first, A(1))?;
+                } else {
+                    commands.insert(first, A(2))?; // a replacement: no allocation
+                    commands.insert(second, B(3))?; // the new table {B} needs memory
+                    commands.insert(first, A(4))?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    let mut schedule = builder.build().unwrap();
+    schedule.run(&mut world, &pool).unwrap();
+    assert_eq!(world.get::<A>(first), Some(&A(1)));
+
+    world.resource_mut::<Phase>().unwrap().0 = 1;
+    // The frame itself and the replacement do not allocate (warm buffers); the first
+    // allocation is the new table, at the sync point. Building the error allocates again.
+    match refusing_once(|| schedule.run(&mut world, &pool)) {
+        Err(EcsError::CommandFailed { system, source, .. }) => {
+            assert_eq!(system, "edit");
+            assert!(matches!(*source, EcsError::OutOfMemory { .. }));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // Applied before the failure: kept; the failing command and the rest: discarded.
+    assert_eq!(world.get::<A>(first), Some(&A(2)));
+    assert_eq!(world.get::<B>(second), None);
+
+    schedule.run(&mut world, &pool).unwrap();
+    assert_eq!(world.get::<A>(first), Some(&A(4)));
+    assert_eq!(world.get::<B>(second), Some(&B(3)));
 }
 
 #[test]

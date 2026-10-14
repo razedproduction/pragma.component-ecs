@@ -4,7 +4,7 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 
-use crate::component::{Column, Component};
+use crate::component::{Column, ColumnData, Component, Ticks};
 use crate::{EcsError, Entity};
 
 pub(crate) struct Archetype {
@@ -65,27 +65,32 @@ impl Archetype {
         self.columns
             .get(column)?
             .as_any()
-            .downcast_ref::<Vec<T>>()?
+            .downcast_ref::<ColumnData<T>>()?
+            .values()
             .get(row)
     }
 
-    pub(crate) fn get_mut<T: Component>(&mut self, row: usize) -> Option<&mut T> {
-        let column = self.types.binary_search(&TypeId::of::<T>()).ok()?;
-        self.columns
-            .get_mut(column)?
-            .as_any_mut()
-            .downcast_mut::<Vec<T>>()?
-            .get_mut(row)
+    /// The component of `T` at `row`, its changed tick stamped with `tick` (DECISIONS #28).
+    pub(crate) fn get_mut<T: Component>(&mut self, row: usize, tick: u64) -> Option<&mut T> {
+        let (value, changed) = self.column_mut::<T>()?.get_mut(row)?;
+        *changed = tick;
+        Some(value)
     }
 
     /// The whole column of `T`, to lend it to a frame (DECISIONS #18). Callers must not change
     /// its length.
-    pub(crate) fn column_mut<T: Component>(&mut self) -> Option<&mut Vec<T>> {
+    pub(crate) fn column_mut<T: Component>(&mut self) -> Option<&mut ColumnData<T>> {
         let column = self.types.binary_search(&TypeId::of::<T>()).ok()?;
         self.columns
             .get_mut(column)?
             .as_any_mut()
-            .downcast_mut::<Vec<T>>()
+            .downcast_mut::<ColumnData<T>>()
+    }
+
+    /// The change ticks of the column of type `ty`, if the table has one.
+    pub(crate) fn ticks(&self, ty: TypeId) -> Option<Ticks<'_>> {
+        let column = self.types.binary_search(&ty).ok()?;
+        Some(self.columns.get(column)?.ticks())
     }
 
     pub(crate) fn add_edge(&self, ty: TypeId) -> Option<usize> {
@@ -128,18 +133,12 @@ impl Archetype {
         row
     }
 
-    /// Pushes `value` into the column of `T`; `false` if the table has no such column.
-    pub(crate) fn push_component<T: Component>(&mut self, value: T) -> bool {
-        let Ok(column) = self.types.binary_search(&TypeId::of::<T>()) else {
-            return false;
-        };
-        match self
-            .columns
-            .get_mut(column)
-            .and_then(|c| c.as_any_mut().downcast_mut::<Vec<T>>())
-        {
+    /// Pushes `value`, added at `tick`, into the column of `T`; `false` if the table has no such
+    /// column.
+    pub(crate) fn push_component<T: Component>(&mut self, value: T, tick: u64) -> bool {
+        match self.column_mut::<T>() {
             Some(column) => {
-                column.push(value);
+                column.push(value, tick, tick);
                 true
             }
             None => false,

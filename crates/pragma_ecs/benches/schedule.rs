@@ -47,15 +47,15 @@ fn regenerate(health: &mut Health) {
 
 fn movement(mut bodies: View<(&mut Position, &Velocity)>, dt: Res<Dt>) -> Result<(), EcsError> {
     let dt = dt.0;
-    bodies.par_for_each_mut(Grain::Auto, |(p, v)| advance(p, v, dt))
+    bodies.par_for_each_mut(Grain::Auto, |(mut p, v)| advance(&mut p, v, dt))
 }
 
 fn aging(mut ages: View<&mut Age>) -> Result<(), EcsError> {
-    ages.par_for_each_mut(Grain::Auto, |a| a.0 += 1)
+    ages.par_for_each_mut(Grain::Auto, |mut a| a.0 += 1)
 }
 
 fn health(mut healths: View<&mut Health>) -> Result<(), EcsError> {
-    healths.par_for_each_mut(Grain::Auto, regenerate)
+    healths.par_for_each_mut(Grain::Auto, |mut h| regenerate(&mut h))
 }
 
 fn energy(mut velocities: View<&Velocity>, mut energy: ResMut<Energy>) -> Result<(), EcsError> {
@@ -109,16 +109,16 @@ fn bench_frame(c: &mut Criterion) {
     g.bench_function(BenchmarkId::new("queries", N), |b| {
         b.iter(|| {
             let dt = reference.resource::<Dt>().unwrap().0;
-            for (p, v) in bodies.iter_mut(&mut reference).unwrap() {
-                advance(p, v, dt);
+            for (mut p, v) in bodies.iter_mut(&mut reference).unwrap() {
+                advance(&mut p, v, dt);
             }
             ages.iter_mut(&mut reference)
                 .unwrap()
-                .for_each(|a| a.0 += 1);
+                .for_each(|mut a| a.0 += 1);
             healths
                 .iter_mut(&mut reference)
                 .unwrap()
-                .for_each(regenerate);
+                .for_each(|mut h| regenerate(&mut h));
             let total = velocities.iter(&reference).unwrap().map(kinetic).sum();
             reference.resource_mut::<Energy>().unwrap().0 = total;
         });

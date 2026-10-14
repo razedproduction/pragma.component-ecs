@@ -12,7 +12,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 | M1 | 0.1.0 | Entities and component storage | ✅ |
 | M2 | 0.2.0 | Queries | 🚧 |
 | M3 | 0.3.0 | Systems on the pragma.core frame graph, vertical slice | 🚧 |
-| M4 | 0.4.0 | Commands, events, change detection | 📋 |
+| M4 | 0.4.0 | Commands, events, change detection | 🚧 |
 | M5 | 0.5.0 | Hardening: determinism, fuzz, benches, semver | 📋 |
 | M6 | 1.0.0 | Stable API, publication | 📋 |
 
@@ -63,11 +63,24 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] Property tests of schedules: random system sets build iff no unordered conflict, a frame
   equals a sequential run (`tests/schedule.rs`); frame benchmark (`benches/schedule.rs`)
 
-## M4 — Commands, events, change detection (0.4.0)
+## M4 — Commands, events, change detection (0.4.0) 🚧
 
-- [ ] Deferred commands (spawn/despawn/insert from systems), applied at a sync point
-- [ ] Events (double-buffered)
-- [ ] Added / changed tracking per component
+- [x] **Decisions:** deferred commands with ids allocated at the sync point (DECISIONS #23), one
+  sync point at the end of `Schedule::run` in registration order (#24), lenient command failures
+  and `EcsError::CommandFailed` (#25), events published at the sync point (#26), `u64` change
+  ticks next to the values (#27), `Mut<T>` and row filters through a mask, no `unsafe` (#28)
+- [x] Deferred commands (spawn/despawn/insert/remove from systems: `Commands`,
+  `EntityCommands`), applied at the sync point, identical on 1 and N workers (`tests/commands.rs`
+  against direct world operations, `tests/oom.rs`)
+- [x] Events (double-buffered): `Events<T>`, `EventWriter`, `EventReader`, `EventCursor`,
+  `World::send_event` (`tests/events.rs`)
+- [x] Added / changed tracking per component: `Mut<T>`, `Added<T>`, `Changed<T>`
+  (`tests/change.rs` against a per-entity tick oracle)
+- [x] `examples/ecs_sim`: deaths through commands and a `Death` event, respawning, systems
+  reacting to `Changed<Health>` and `Added<Age>`; the per-tick hash identical on 1, 2 and N
+  workers
+- [x] Benchmarks: command application (`benches/commands.rs`), change-detection overhead
+  (`benches/change.rs`)
 
 ## M5 — Hardening (0.5.0)
 

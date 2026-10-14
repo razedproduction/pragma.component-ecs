@@ -2,14 +2,15 @@
 
 use std::fmt;
 use std::mem;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pragma_core::graph::{FrameGraph, FrameGraphBuilder, GraphError, TaskContext};
 use pragma_core::jobs::ThreadPool;
 
 use crate::access::Access;
+use crate::event::EventType;
 use crate::lend::{Lender, WorldSlot, data_name};
-use crate::system::{BoxError, Env, IntoSystem, Prepared, RunSystem};
+use crate::system::{BoxError, Env, IntoSystem, Prepared, RunSystem, SystemTicks};
 use crate::{EcsError, World};
 
 /// The explicit order of a system relative to others, given to
@@ -59,24 +60,59 @@ impl SystemConfig {
 /// The error a system returned: its message, and the error itself if it was an [`EcsError`].
 type Failure = (String, Option<EcsError>);
 
-/// A registered system: its name, access and the error it returned in the last frame.
+/// A system with what the schedule tracks about it between frames.
+struct Cell {
+    system: Box<dyn RunSystem>,
+    /// The system's position in the schedule's stable topological order: its tick in a frame
+    /// is the frame's base tick plus this (DECISIONS #27).
+    position: u64,
+    /// The tick of its last run, and the world it ran over.
+    last_run: u64,
+    world: Option<u64>,
+    /// Whether it completed without an error in the current frame; only then are its deferred
+    /// commands and events applied (DECISIONS #25).
+    ok: bool,
+}
+
+/// The system, shared by its frame-graph task and the schedule's sync point.
+type Shared = Arc<Mutex<Cell>>;
+
+fn lock(cell: &Shared) -> MutexGuard<'_, Cell> {
+    cell.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A registered system: its name, access, the error it returned in the last frame and the
+/// system itself.
 struct SystemInfo {
     name: String,
     access: Access,
     failure: Arc<Mutex<Option<Failure>>>,
+    cell: Shared,
 }
 
 /// The work of one frame-graph task.
 struct Task {
-    system: Mutex<Box<dyn RunSystem>>,
+    cell: Shared,
     failure: Arc<Mutex<Option<Failure>>>,
 }
 
 impl Task {
     fn run(&self, ctx: &TaskContext<'_>) -> Result<(), BoxError> {
         let world = ctx.read::<WorldSlot>().map_err(EcsError::graph)?;
-        let mut system = self.system.lock().unwrap_or_else(PoisonError::into_inner);
-        let result = system.run(Env::new(ctx, &world.0));
+        let mut cell = lock(&self.cell);
+        let id = world.0.id();
+        if cell.world != Some(id) {
+            cell.world = Some(id);
+            cell.last_run = 0;
+        }
+        let ticks = SystemTicks {
+            last_run: cell.last_run,
+            this_run: world.0.frame_base().saturating_add(cell.position),
+        };
+        cell.ok = false;
+        let result = cell.system.run(Env::new(ctx, &world.0, ticks));
+        cell.last_run = ticks.this_run;
+        cell.ok = result.is_ok();
         if let Err(error) = &result {
             let typed = error.downcast_ref::<EcsError>().cloned();
             *self.failure.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -94,7 +130,7 @@ impl Task {
 /// struct Health(u32);
 ///
 /// fn regenerate(mut healths: View<&mut Health>) -> Result<(), EcsError> {
-///     healths.iter_mut()?.for_each(|h| h.0 += 1);
+///     healths.iter_mut()?.for_each(|mut h| h.0 += 1);
 ///     Ok(())
 /// }
 ///
@@ -114,6 +150,8 @@ pub struct ScheduleBuilder {
     systems: Vec<SystemInfo>,
     /// One per component type some system uses, in registration order.
     lenders: Vec<Lender>,
+    /// One per event type some system writes or reads, in registration order.
+    events: Vec<EventType>,
 }
 
 impl fmt::Debug for ScheduleBuilder {
@@ -193,10 +231,23 @@ impl ScheduleBuilder {
                 self.lenders.push(lender);
             }
         }
+        for event in access.events() {
+            if !self.events.contains(&event) {
+                self.events.try_reserve(1).map_err(oom)?;
+                self.events.push(event);
+            }
+        }
 
         let failure = Arc::new(Mutex::new(None));
+        let cell = Arc::new(Mutex::new(Cell {
+            system,
+            position: 0,
+            last_run: 0,
+            world: None,
+            ok: false,
+        }));
         let task = Task {
-            system: Mutex::new(system),
+            cell: Arc::clone(&cell),
             failure: Arc::clone(&failure),
         };
         self.graph.task(
@@ -212,6 +263,7 @@ impl ScheduleBuilder {
             name,
             access,
             failure,
+            cell,
         });
         Ok(self)
     }
@@ -229,12 +281,21 @@ impl ScheduleBuilder {
             graph,
             systems,
             lenders,
+            events,
         } = self;
         let graph = graph.build().map_err(|error| map_error(error, &systems))?;
+        // A system's tick in a frame follows the stable topological order, which every pair of
+        // conflicting systems runs in (DECISIONS #27).
+        for (position, name) in (0_u64..).zip(graph.order()) {
+            if let Some(system) = systems.iter().find(|s| s.name == name) {
+                lock(&system.cell).position = position;
+            }
+        }
         Ok(Schedule {
             graph,
             systems,
             lenders,
+            events,
         })
     }
 }
@@ -257,7 +318,7 @@ impl ScheduleBuilder {
 /// struct Energy(f32);
 ///
 /// fn movement(mut bodies: View<(&mut Position, &Velocity)>, dt: Res<Dt>) -> Result<(), EcsError> {
-///     for (position, velocity) in bodies.iter_mut()? {
+///     for (mut position, velocity) in bodies.iter_mut()? {
 ///         position.0 += velocity.0 * dt.0;
 ///     }
 ///     Ok(())
@@ -293,6 +354,7 @@ pub struct Schedule {
     graph: FrameGraph,
     systems: Vec<SystemInfo>,
     lenders: Vec<Lender>,
+    events: Vec<EventType>,
 }
 
 impl fmt::Debug for Schedule {
@@ -311,6 +373,7 @@ impl Schedule {
             graph: FrameGraph::builder(),
             systems: Vec::new(),
             lenders: Vec::new(),
+            events: Vec::new(),
         }
     }
 
@@ -372,34 +435,44 @@ impl Schedule {
     }
 
     /// Runs a frame: every system once, after the systems ordered before it; independent
-    /// systems in parallel on `pool`.
+    /// systems in parallel on `pool`; then the sync point.
     ///
     /// The columns of every component type a system uses are lent to the frame graph and
-    /// returned afterwards, also after a failed frame (DECISIONS #18). Call it from a thread
-    /// outside the pool (the main loop): that thread runs systems too.
+    /// returned afterwards, also after a failed frame (DECISIONS #18). At the sync point the
+    /// event types the systems use are updated, then the commands and events every system
+    /// deferred are applied, system after system in registration order (DECISIONS #24). Call it
+    /// from a thread outside the pool (the main loop): that thread runs systems too.
     ///
     /// # Errors
     ///
     /// [`EcsError::MissingResource`] before any system runs if the world lacks a resource a
-    /// system takes. [`EcsError::SystemFailed`] / [`EcsError::SystemPanicked`] if a system
-    /// returned an error or panicked: independent systems still ran, the systems ordered after
-    /// it did not, and the error of the system registered first is returned. A pool failure is
-    /// [`EcsError::Job`]; [`EcsError::OutOfMemory`] if the lending slots cannot grow (nothing
-    /// ran). The schedule and the world stay usable after any error.
+    /// system takes (no sync point then). [`EcsError::SystemFailed`] /
+    /// [`EcsError::SystemPanicked`] if a system returned an error or panicked: independent
+    /// systems still ran, the systems ordered after it did not, the error of the system
+    /// registered first is returned, and only that system's deferred commands are discarded.
+    /// [`EcsError::CommandFailed`] if applying deferred commands or events failed (the rest is
+    /// discarded, DECISIONS #25). A pool failure is [`EcsError::Job`];
+    /// [`EcsError::OutOfMemory`] if the lending slots cannot grow (nothing ran). The schedule and
+    /// the world stay usable after any error.
     pub fn run(&mut self, world: &mut World, pool: &ThreadPool) -> Result<(), EcsError> {
         for system in &self.systems {
             *system
                 .failure
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = None;
+            lock(&system.cell).ok = false;
         }
         // Everything that can fail happens before the first column is lent.
         if !world.resources_mut().contains::<WorldSlot>() {
             world.resources_mut().insert(WorldSlot(World::new()));
         }
+        for event in &self.events {
+            event.ensure(world);
+        }
         for lender in &self.lenders {
             lender.prepare(world)?;
         }
+        world.begin_frame(self.systems.len());
 
         for lender in &self.lenders {
             lender.swap(world);
@@ -416,7 +489,36 @@ impl Schedule {
         for lender in &self.lenders {
             lender.swap(world);
         }
-        result.map_err(|error| map_error(error, &self.systems))
+
+        let started = !matches!(result, Err(GraphError::MissingResource { .. }));
+        let applied = if started { self.sync(world) } else { Ok(()) };
+        result.map_err(|error| map_error(error, &self.systems))?;
+        applied
+    }
+
+    /// The sync point (DECISIONS #24, #25): updates the event types, then applies the deferred
+    /// buffers of the systems that completed, in registration order. After a failure the rest
+    /// is discarded.
+    fn sync(&self, world: &mut World) -> Result<(), EcsError> {
+        for event in &self.events {
+            event.update(world);
+        }
+        let mut applied = Ok(());
+        for system in &self.systems {
+            let mut cell = lock(&system.cell);
+            if !cell.ok || applied.is_err() {
+                cell.system.discard();
+                continue;
+            }
+            if let Err(source) = cell.system.apply(world) {
+                cell.system.discard();
+                applied = Err(EcsError::CommandFailed {
+                    system: system.name.clone(),
+                    source: Box::new(source),
+                });
+            }
+        }
+        applied
     }
 }
 

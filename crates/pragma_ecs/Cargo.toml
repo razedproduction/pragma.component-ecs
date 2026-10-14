@@ -29,5 +29,13 @@ harness = false
 name = "schedule"
 harness = false
 
+[[bench]]
+name = "commands"
+harness = false
+
+[[bench]]
+name = "change"
+harness = false
+
 [lints]
 workspace = true

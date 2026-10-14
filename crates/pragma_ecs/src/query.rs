@@ -1,4 +1,4 @@
-//! Queries: typed iteration over the entities whose components match (DECISIONS #12–#15).
+//! Queries: typed iteration over the entities whose components match (DECISIONS #12–#15, #28).
 
 use std::any::TypeId;
 use std::fmt;
@@ -10,20 +10,23 @@ use pragma_core::jobs::{Grain, ThreadPool};
 
 use crate::access::Access;
 use crate::archetype::Archetype;
+use crate::component::Ticks;
 use crate::fetch::{ColumnRef, QueryData, QueryFilter, ReadOnlyQueryData};
 use crate::{EcsError, Entity, World};
 
 /// A typed query: the entities that have the components `Q` asks for and pass the filter `F`.
 ///
 /// `Q` is what is yielded per entity ([`QueryData`]: `&T`, `&mut T`, `Option<&T>`, [`Entity`]
-/// or a tuple of them); `F` restricts the tables visited ([`QueryFilter`]: [`With`],
-/// [`Without`] or a tuple of them; `()` by default).
+/// or a tuple of them); `F` restricts the entities visited ([`QueryFilter`]: [`With`],
+/// [`Without`], [`Added`], [`Changed`] or a tuple of them; `()` by default). `&mut T` yields a
+/// [`Mut<T>`](crate::Mut), which records the change when it is written.
 ///
 /// A `Query` is built once and reused: it does not borrow the world. [`new`](Self::new) checks
 /// the declared [`Access`] and rejects aliasing (`(&A, &mut A)`) as
 /// [`EcsError::ConflictingAccess`]. Every call remembers which archetype tables match, so the
-/// next call only checks the tables created since (DECISIONS #12). Using a query with another
-/// world is allowed; the cache is then rebuilt.
+/// next call only checks the tables created since (DECISIONS #12), and the world's change tick,
+/// so that [`Added`] and [`Changed`] mean "since this query's previous call" (DECISIONS #27).
+/// Using a query with another world is allowed; the cache and the tick are then reset.
 ///
 /// Rows are visited table by table, in table creation order, and within a table in row order.
 /// That order is deterministic for the same sequence of world operations, but it is not the
@@ -31,6 +34,8 @@ use crate::{EcsError, Entity, World};
 ///
 /// [`With`]: crate::With
 /// [`Without`]: crate::Without
+/// [`Added`]: crate::Added
+/// [`Changed`]: crate::Changed
 ///
 /// ```
 /// use pragma_ecs::{Query, Without, World};
@@ -52,13 +57,13 @@ use crate::{EcsError, Entity, World};
 /// }
 ///
 /// let mut movement = Query::<(&mut Position, &Velocity), Without<Frozen>>::new()?;
-/// for (position, velocity) in movement.iter_mut(&mut world)? {
+/// for (mut position, velocity) in movement.iter_mut(&mut world)? {
 ///     position.0 += velocity.0;
 /// }
 ///
 /// // The same query, its rows split into chunks over the pragma.core thread pool.
 /// let pool = ThreadPool::new(PoolConfig::default().with_workers(2))?;
-/// movement.par_for_each_mut(&mut world, &pool, Grain::Auto, |(position, velocity)| {
+/// movement.par_for_each_mut(&mut world, &pool, Grain::Auto, |(mut position, velocity)| {
 ///     position.0 += velocity.0;
 /// })?;
 ///
@@ -75,6 +80,10 @@ pub struct Query<Q: QueryData, F: QueryFilter = ()> {
     seen: usize,
     /// Ids of the matching tables, ascending.
     matched: Vec<usize>,
+    /// The world's change tick at the previous call (DECISIONS #27).
+    last_run: u64,
+    /// For a row filter: whether each row of the matching tables passes, table after table.
+    mask: Vec<bool>,
     marker: PhantomData<fn() -> (Q, F)>,
 }
 
@@ -91,11 +100,12 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     /// A query for `Q` filtered by `F`, with its declared access checked.
     ///
     /// ```
-    /// use pragma_ecs::{EcsError, Query};
+    /// use pragma_ecs::{Changed, EcsError, Query};
     ///
     /// struct A;
     ///
     /// assert!(Query::<(&A, &A)>::new().is_ok()); // repeated reads are fine
+    /// assert!(Query::<&mut A, Changed<A>>::new().is_ok()); // a filter reads ticks first
     /// assert!(matches!(
     ///     Query::<(&A, Option<&A>, &mut A)>::new(),
     ///     Err(EcsError::ConflictingAccess { .. })
@@ -109,11 +119,14 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     pub fn new() -> Result<Self, EcsError> {
         let mut access = Access::new();
         Q::declare(&mut access)?;
+        F::declare(&mut access)?;
         Ok(Self {
             access,
             world: None,
             seen: 0,
             matched: Vec::new(),
+            last_run: 0,
+            mask: Vec::new(),
             marker: PhantomData,
         })
     }
@@ -121,12 +134,13 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     /// The component types the query reads and writes.
     ///
     /// ```
-    /// use pragma_ecs::{AccessKind, Entity, Query};
+    /// use pragma_ecs::{AccessKind, Changed, Entity, Query};
     ///
-    /// let query = Query::<(Entity, &mut u32, Option<&u8>)>::new()?;
+    /// let query = Query::<(Entity, &mut u32, Option<&u8>), Changed<u16>>::new()?;
     /// assert_eq!(query.access().kind_of::<u32>(), Some(AccessKind::Write));
     /// assert_eq!(query.access().kind_of::<u8>(), Some(AccessKind::Read));
-    /// assert_eq!(query.access().len(), 2);
+    /// assert_eq!(query.access().kind_of::<u16>(), Some(AccessKind::Read)); // its ticks
+    /// assert_eq!(query.access().len(), 3);
     /// # Ok::<(), pragma_ecs::EcsError>(())
     /// ```
     #[must_use]
@@ -155,21 +169,24 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     ///
     /// # Errors
     ///
-    /// [`EcsError::OutOfMemory`] if the cache of matching tables cannot grow.
-    pub fn iter<'w, 's>(&'s mut self, world: &'w World) -> Result<QueryIter<'w, 's, Q>, EcsError>
+    /// [`EcsError::OutOfMemory`] if the cache of matching tables or the row mask of a row
+    /// filter cannot grow.
+    pub fn iter<'w, 's>(&'s mut self, world: &'w World) -> Result<QueryIter<'w, 's, Q, F>, EcsError>
     where
         Q: ReadOnlyQueryData,
     {
-        self.update(world)?;
+        let last_run = self.begin(world, world.change_tick())?;
+        self.fill_world_mask(world, last_run)?;
         Ok(QueryIter {
             tables: world.archetypes(),
             ids: self.matched.iter(),
+            masks: Masks::new(&self.mask),
             rows: None,
         })
     }
 
     /// Iterates the matching entities of `world`, with mutable access to the components `Q`
-    /// writes.
+    /// writes (as [`Mut<T>`](crate::Mut)).
     ///
     /// ```
     /// use pragma_ecs::{Query, World};
@@ -179,7 +196,7 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     /// world.insert(entity, 1_u32)?;
     ///
     /// let mut query = Query::<&mut u32>::new()?;
-    /// for value in query.iter_mut(&mut world)? {
+    /// for mut value in query.iter_mut(&mut world)? {
     ///     *value += 1;
     /// }
     /// assert_eq!(world.get::<u32>(entity), Some(&2));
@@ -188,14 +205,19 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     ///
     /// # Errors
     ///
-    /// [`EcsError::OutOfMemory`] if the cache of matching tables cannot grow.
+    /// [`EcsError::OutOfMemory`] if the cache of matching tables or the row mask of a row
+    /// filter cannot grow.
     pub fn iter_mut<'w, 's>(
         &'s mut self,
         world: &'w mut World,
-    ) -> Result<QueryIterMut<'w, 's, Q>, EcsError> {
-        self.update(world)?;
+    ) -> Result<QueryIterMut<'w, 's, Q, F>, EcsError> {
+        let tick = world.next_tick();
+        let last_run = self.begin(world, tick)?;
+        self.fill_world_mask(world, last_run)?;
         Ok(QueryIterMut {
             tables: TablesMut::new(world.archetypes_mut(), &self.matched),
+            masks: Masks::new(&self.mask),
+            tick,
             rows: None,
         })
     }
@@ -231,7 +253,8 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     /// # Errors
     ///
     /// [`EcsError::Job`] if `f` panicked (the other chunks still run to completion);
-    /// [`EcsError::OutOfMemory`] if the cache or the chunk list cannot be allocated.
+    /// [`EcsError::OutOfMemory`] if the cache, the row mask or the chunk list cannot be
+    /// allocated.
     pub fn par_for_each<'w, G>(
         &mut self,
         world: &'w World,
@@ -243,11 +266,16 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
         Q: ReadOnlyQueryData,
         G: Fn(Q::Item<'w>) + Sync,
     {
-        self.update(world)?;
+        let last_run = self.begin(world, world.change_tick())?;
+        self.fill_world_mask(world, last_run)?;
         let tables = world.archetypes();
         let matched = || self.matched.iter().filter_map(|&id| tables.get(id));
         let plan = Plan::new(matched().map(Archetype::len), grain);
-        let rows = matched().filter_map(|table| Some((table.len(), fetch_shared::<Q>(table)?)));
+        let mut masks = Masks::<F>::new(&self.mask);
+        let rows = matched().filter_map(|table| {
+            let mask = masks.take(table.len());
+            Some((table.len(), fetch_shared::<Q>(table)?, mask))
+        });
         run::<Q, G>(rows, plan, pool, &f, world.len())
     }
 
@@ -270,7 +298,7 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     ///
     /// let pool = ThreadPool::new(PoolConfig::default().with_workers(2))?;
     /// let mut movement = Query::<(&mut Position, &Velocity)>::new()?;
-    /// movement.par_for_each_mut(&mut world, &pool, Grain::Auto, |(position, velocity)| {
+    /// movement.par_for_each_mut(&mut world, &pool, Grain::Auto, |(mut position, velocity)| {
     ///     position.0 += velocity.0;
     /// })?;
     /// assert!(Query::<&Position>::new()?.iter(&world)?.all(|p| p.0 == 0.5));
@@ -280,7 +308,8 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     /// # Errors
     ///
     /// [`EcsError::Job`] if `f` panicked (the other chunks still run to completion);
-    /// [`EcsError::OutOfMemory`] if the cache or the chunk list cannot be allocated.
+    /// [`EcsError::OutOfMemory`] if the cache, the row mask or the chunk list cannot be
+    /// allocated.
     pub fn par_for_each_mut<'w, G>(
         &mut self,
         world: &'w mut World,
@@ -291,7 +320,9 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
     where
         G: Fn(Q::Item<'w>) + Sync,
     {
-        self.update(world)?;
+        let tick = world.next_tick();
+        let last_run = self.begin(world, tick)?;
+        self.fill_world_mask(world, last_run)?;
         let entities = world.len();
         let tables = world.archetypes();
         let plan = Plan::new(
@@ -301,9 +332,27 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
                 .map(Archetype::len),
             grain,
         );
-        let rows = TablesMut::new(world.archetypes_mut(), &self.matched)
-            .filter_map(|table| Some((table.len(), fetch_unique::<Q>(table)?)));
+        let mut masks = Masks::<F>::new(&self.mask);
+        let rows = TablesMut::new(world.archetypes_mut(), &self.matched).filter_map(|table| {
+            let mask = masks.take(table.len());
+            Some((table.len(), fetch_unique::<Q>(table, tick)?, mask))
+        });
         run::<Q, G>(rows, plan, pool, &f, entities)
+    }
+
+    /// Brings the cache up to date with `world` and records `now` as the tick of this call;
+    /// returns the tick of the previous call.
+    fn begin(&mut self, world: &World, now: u64) -> Result<u64, EcsError> {
+        self.update(world)?;
+        Ok(mem::replace(&mut self.last_run, now))
+    }
+
+    /// Fills the row mask from the tick columns of the world's tables.
+    fn fill_world_mask(&mut self, world: &World, last_run: u64) -> Result<(), EcsError> {
+        let tables = world.archetypes();
+        self.fill_mask(tables, last_run, world.len(), |id, ty| {
+            tables.get(id)?.ticks(ty)
+        })
     }
 
     /// Brings the cache of matching tables up to date with `world`.
@@ -312,6 +361,7 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
             self.world = Some(world.id());
             self.seen = 0;
             self.matched.clear();
+            self.last_run = 0;
         }
         let tables = world.archetypes();
         for (id, table) in tables.iter().enumerate().skip(self.seen) {
@@ -329,9 +379,42 @@ impl<Q: QueryData, F: QueryFilter> Query<Q, F> {
         Ok(())
     }
 
+    /// Fills the row mask of a row filter for the matching tables of `tables` (nothing for a
+    /// table filter); `ticks(table id, type)` looks up a tick column.
+    pub(crate) fn fill_mask<'a>(
+        &mut self,
+        tables: &[Archetype],
+        last_run: u64,
+        entities: usize,
+        ticks: impl Fn(usize, TypeId) -> Option<Ticks<'a>>,
+    ) -> Result<(), EcsError> {
+        self.mask.clear();
+        if F::DENSE {
+            return Ok(());
+        }
+        let rows = |id: &usize| tables.get(*id).map_or(0, Archetype::len);
+        let total = self.matched.iter().map(rows).fold(0, usize::saturating_add);
+        self.mask
+            .try_reserve(total)
+            .map_err(|_| EcsError::OutOfMemory { entities })?;
+        for id in &self.matched {
+            let start = self.mask.len();
+            self.mask.resize(start.saturating_add(rows(id)), true);
+            if let Some(segment) = self.mask.get_mut(start..) {
+                F::mask(&|ty| ticks(*id, ty), last_run, segment);
+            }
+        }
+        Ok(())
+    }
+
     /// Ids of the matching tables, ascending, as of the last [`update`](Self::update).
     pub(crate) fn matched(&self) -> &[usize] {
         &self.matched
+    }
+
+    /// The row mask of the last [`fill_mask`](Self::fill_mask).
+    pub(crate) fn mask(&self) -> &[bool] {
+        &self.mask
     }
 }
 
@@ -340,12 +423,13 @@ fn fetch<'w, Q: QueryData>(
     types: &[TypeId],
     columns: impl Iterator<Item = ColumnRef<'w>>,
     entities: &'w [Entity],
+    tick: u64,
 ) -> Option<Q::Slice<'w>> {
     let mut state = Q::State::default();
     for (ty, column) in types.iter().zip(columns) {
         Q::offer(&mut state, *ty, &mut Some(column));
     }
-    Q::finish(state, entities)
+    Q::finish(state, entities, tick)
 }
 
 fn fetch_shared<Q: QueryData>(table: &Archetype) -> Option<Q::Slice<'_>> {
@@ -353,15 +437,88 @@ fn fetch_shared<Q: QueryData>(table: &Archetype) -> Option<Q::Slice<'_>> {
         .columns()
         .iter()
         .map(|c| ColumnRef::Shared(c.as_any()));
-    fetch::<Q>(table.types(), columns, table.entities())
+    fetch::<Q>(table.types(), columns, table.entities(), 0)
 }
 
-fn fetch_unique<Q: QueryData>(table: &mut Archetype) -> Option<Q::Slice<'_>> {
+fn fetch_unique<Q: QueryData>(table: &mut Archetype, tick: u64) -> Option<Q::Slice<'_>> {
     let (types, columns, entities) = table.parts_mut();
     let columns = columns
         .iter_mut()
         .map(|c| ColumnRef::Unique(c.as_any_mut()));
-    fetch::<Q>(types, columns, entities)
+    fetch::<Q>(types, columns, entities, tick)
+}
+
+/// Hands out the row mask of a filter table by table; `None` for a table filter.
+pub(crate) struct Masks<'m, F> {
+    rest: &'m [bool],
+    marker: PhantomData<fn() -> F>,
+}
+
+impl<'m, F: QueryFilter> Masks<'m, F> {
+    pub(crate) fn new(mask: &'m [bool]) -> Self {
+        Self {
+            rest: mask,
+            marker: PhantomData,
+        }
+    }
+
+    /// The mask of the next table, of `rows` rows.
+    pub(crate) fn take(&mut self, rows: usize) -> Option<&'m [bool]> {
+        if F::DENSE {
+            return None;
+        }
+        let (mask, rest) = self.rest.split_at(rows.min(self.rest.len()));
+        self.rest = rest;
+        Some(mask)
+    }
+}
+
+/// The rows of one table that pass a row filter's mask (all rows without one).
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Masked<'m, I> {
+    items: I,
+    mask: Option<slice::Iter<'m, bool>>,
+}
+
+impl<'m, I> Masked<'m, I> {
+    pub(crate) fn new(items: I, mask: Option<&'m [bool]>) -> Self {
+        Self {
+            items,
+            mask: mask.map(<[bool]>::iter),
+        }
+    }
+}
+
+impl<I: Iterator> Iterator for Masked<'_, I> {
+    type Item = I::Item;
+
+    fn fold<B, G: FnMut(B, Self::Item) -> B>(self, init: B, mut g: G) -> B {
+        match self.mask {
+            None => self.items.fold(init, g),
+            Some(mask) => self.items.zip(mask).fold(
+                init,
+                |acc, (item, keep)| {
+                    if *keep { g(acc, item) } else { acc }
+                },
+            ),
+        }
+    }
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let item = self.items.next()?;
+            match &mut self.mask {
+                None => return Some(item),
+                Some(mask) => {
+                    if mask.next().copied().unwrap_or(false) {
+                        return Some(item);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The tables with the given ascending ids, mutably, without `unsafe`: the slice of tables is
@@ -417,9 +574,13 @@ impl Plan {
     }
 }
 
-/// Splits the rows of every table into chunks by `plan` and runs `f` over them on `pool`.
-pub(crate) fn run<'w, Q, G>(
-    tables: impl Iterator<Item = (usize, Q::Slice<'w>)>,
+/// The rows of a chunk and their part of the row mask, if any.
+type Chunk<'w, 'm, Q> = (<Q as QueryData>::Slice<'w>, Option<&'m [bool]>);
+
+/// Splits the rows of every table (with its row mask, if any) into chunks by `plan` and runs
+/// `f` over the rows that pass on `pool`.
+pub(crate) fn run<'w, 'm, Q, G>(
+    tables: impl Iterator<Item = (usize, Q::Slice<'w>, Option<&'m [bool]>)>,
     plan: Plan,
     pool: &ThreadPool,
     f: &G,
@@ -429,25 +590,33 @@ where
     Q: QueryData,
     G: Fn(Q::Item<'w>) + Sync,
 {
-    let mut chunks: Vec<Option<Q::Slice<'w>>> = Vec::new();
+    let mut chunks: Vec<Option<Chunk<'w, 'm, Q>>> = Vec::new();
     chunks
         .try_reserve_exact(plan.chunks)
         .map_err(|_| EcsError::OutOfMemory { entities })?;
-    for (mut len, mut rows) in tables {
+    for (mut len, mut rows, mut mask) in tables {
         while len > plan.size {
             let (head, tail) = Q::split_at(rows, plan.size);
-            chunks.push(Some(head));
+            let (head_mask, tail_mask) = match mask {
+                Some(mask) => {
+                    let (head, tail) = mask.split_at(plan.size.min(mask.len()));
+                    (Some(head), Some(tail))
+                }
+                None => (None, None),
+            };
+            chunks.push(Some((head, head_mask)));
             rows = tail;
+            mask = tail_mask;
             len = len.saturating_sub(plan.size);
         }
         if len > 0 {
-            chunks.push(Some(rows));
+            chunks.push(Some((rows, mask)));
         }
     }
     debug_assert_eq!(chunks.len(), plan.chunks);
     pool.parallel_for(&mut chunks, Grain::Fixed(1), |chunk| {
-        if let Some(rows) = chunk.take() {
-            Q::iter(rows).for_each(f);
+        if let Some((rows, mask)) = chunk.take() {
+            Masked::new(Q::iter(rows), mask).for_each(f);
         }
     })?;
     Ok(())
@@ -467,14 +636,16 @@ where
 /// assert_eq!(iter.copied().sum::<i32>(), 5);
 /// # Ok::<(), pragma_ecs::EcsError>(())
 /// ```
-pub struct QueryIter<'w, 's, Q: QueryData> {
+pub struct QueryIter<'w, 's, Q: QueryData, F: QueryFilter = ()> {
     tables: &'w [Archetype],
     ids: slice::Iter<'s, usize>,
+    /// The row mask of the tables not visited yet.
+    masks: Masks<'s, F>,
     /// The rest of the current table.
-    rows: Option<Q::Iter<'w>>,
+    rows: Option<Masked<'s, Q::Iter<'w>>>,
 }
 
-impl<Q: QueryData> fmt::Debug for QueryIter<'_, '_, Q> {
+impl<Q: QueryData, F: QueryFilter> fmt::Debug for QueryIter<'_, '_, Q, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryIter")
             .field("tables_left", &self.ids.len())
@@ -482,7 +653,17 @@ impl<Q: QueryData> fmt::Debug for QueryIter<'_, '_, Q> {
     }
 }
 
-impl<'w, Q: QueryData> Iterator for QueryIter<'w, '_, Q> {
+impl<'w, 's, Q: QueryData, F: QueryFilter> QueryIter<'w, 's, Q, F> {
+    /// The rows of the next matching table; `None` when every table was visited.
+    fn table(&mut self) -> Option<Option<Masked<'s, Q::Iter<'w>>>> {
+        let &id = self.ids.next()?;
+        let table = self.tables.get(id)?;
+        let mask = self.masks.take(table.len());
+        Some(fetch_shared::<Q>(table).map(|rows| Masked::new(Q::iter(rows), mask)))
+    }
+}
+
+impl<'w, Q: QueryData, F: QueryFilter> Iterator for QueryIter<'w, '_, Q, F> {
     type Item = Q::Item<'w>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -490,10 +671,22 @@ impl<'w, Q: QueryData> Iterator for QueryIter<'w, '_, Q> {
             if let Some(item) = self.rows.as_mut().and_then(Iterator::next) {
                 return Some(item);
             }
-            let &id = self.ids.next()?;
-            let tables = self.tables;
-            self.rows = tables.get(id).and_then(fetch_shared::<Q>).map(Q::iter);
+            self.rows = self.table()?;
         }
+    }
+
+    fn fold<B, G: FnMut(B, Self::Item) -> B>(mut self, init: B, mut g: G) -> B {
+        let mut acc = self
+            .rows
+            .take()
+            .into_iter()
+            .fold(init, |acc, rows| rows.fold(acc, &mut g));
+        while let Some(rows) = self.table() {
+            acc = rows
+                .into_iter()
+                .fold(acc, |acc, rows| rows.fold(acc, &mut g));
+        }
+        acc
     }
 }
 
@@ -508,17 +701,21 @@ impl<'w, Q: QueryData> Iterator for QueryIter<'w, '_, Q> {
 ///
 /// let mut query = Query::<&mut i32>::new()?;
 /// let iter: QueryIterMut<'_, '_, &mut i32> = query.iter_mut(&mut world)?;
-/// iter.for_each(|value| *value = -*value);
+/// iter.for_each(|mut value| *value = -*value);
 /// assert_eq!(world.get::<i32>(entity), Some(&-5));
 /// # Ok::<(), pragma_ecs::EcsError>(())
 /// ```
-pub struct QueryIterMut<'w, 's, Q: QueryData> {
+pub struct QueryIterMut<'w, 's, Q: QueryData, F: QueryFilter = ()> {
     tables: TablesMut<'w, 's>,
+    /// The row mask of the tables not visited yet.
+    masks: Masks<'s, F>,
+    /// The change tick a write stamps.
+    tick: u64,
     /// The rest of the current table.
-    rows: Option<Q::Iter<'w>>,
+    rows: Option<Masked<'s, Q::Iter<'w>>>,
 }
 
-impl<Q: QueryData> fmt::Debug for QueryIterMut<'_, '_, Q> {
+impl<Q: QueryData, F: QueryFilter> fmt::Debug for QueryIterMut<'_, '_, Q, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryIterMut")
             .field("tables_left", &self.tables.ids.len())
@@ -526,7 +723,16 @@ impl<Q: QueryData> fmt::Debug for QueryIterMut<'_, '_, Q> {
     }
 }
 
-impl<'w, Q: QueryData> Iterator for QueryIterMut<'w, '_, Q> {
+impl<'w, 's, Q: QueryData, F: QueryFilter> QueryIterMut<'w, 's, Q, F> {
+    /// The rows of the next matching table; `None` when every table was visited.
+    fn table(&mut self) -> Option<Option<Masked<'s, Q::Iter<'w>>>> {
+        let table = self.tables.next()?;
+        let mask = self.masks.take(table.len());
+        Some(fetch_unique::<Q>(table, self.tick).map(|rows| Masked::new(Q::iter(rows), mask)))
+    }
+}
+
+impl<'w, Q: QueryData, F: QueryFilter> Iterator for QueryIterMut<'w, '_, Q, F> {
     type Item = Q::Item<'w>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -534,16 +740,29 @@ impl<'w, Q: QueryData> Iterator for QueryIterMut<'w, '_, Q> {
             if let Some(item) = self.rows.as_mut().and_then(Iterator::next) {
                 return Some(item);
             }
-            let table = self.tables.next()?;
-            self.rows = fetch_unique::<Q>(table).map(Q::iter);
+            self.rows = self.table()?;
         }
+    }
+
+    fn fold<B, G: FnMut(B, Self::Item) -> B>(mut self, init: B, mut g: G) -> B {
+        let mut acc = self
+            .rows
+            .take()
+            .into_iter()
+            .fold(init, |acc, rows| rows.fold(acc, &mut g));
+        while let Some(rows) = self.table() {
+            acc = rows
+                .into_iter()
+                .fold(acc, |acc, rows| rows.fold(acc, &mut g));
+        }
+        acc
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{With, Without};
+    use crate::{Changed, With, Without};
 
     #[derive(Debug, PartialEq)]
     struct A(u32);
@@ -561,6 +780,7 @@ mod tests {
         assert_eq!(Query::<(&mut A, (&B, &A))>::new().map(|_| ()), conflict);
         assert!(Query::<(&A, &A, Option<&A>)>::new().is_ok());
         assert!(Query::<(&mut A, &mut B), With<A>>::new().is_ok());
+        assert!(Query::<&mut A, (Changed<A>, Changed<B>)>::new().is_ok());
     }
 
     #[test]
@@ -618,7 +838,7 @@ mod tests {
         let mut iter = query.iter_mut(&mut world).unwrap();
         assert!(format!("{iter:?}").starts_with("QueryIterMut"));
         let mut visited = Vec::new();
-        for (e, a, b) in &mut iter {
+        for (e, mut a, b) in &mut iter {
             a.0 += 100;
             visited.push((e, b.0));
         }
@@ -630,6 +850,81 @@ mod tests {
         for (e, b) in visited {
             assert_eq!(world.get::<A>(e), Some(&A(b + 100)));
         }
+    }
+
+    #[test]
+    fn a_query_sees_changes_since_its_previous_call_only() {
+        let mut world = World::new();
+        let ids: Vec<Entity> = (0..6).map(|_| world.spawn().unwrap()).collect();
+        for (i, e) in (0_u32..).zip(&ids) {
+            world.insert(*e, A(i)).unwrap();
+            if i % 2 == 0 {
+                world.insert(*e, B(i)).unwrap();
+            }
+        }
+        let mut changed = Query::<Entity, Changed<A>>::new().unwrap();
+        let mut double = Query::<(Entity, &mut A), Changed<A>>::new().unwrap();
+        assert_eq!(changed.iter(&world).unwrap().count(), 6);
+
+        // Writes through `Mut` only for odd values; reading is not a change.
+        let mut writer = Query::<&mut A>::new().unwrap();
+        for mut a in writer.iter_mut(&mut world).unwrap() {
+            if a.0 % 2 == 1 {
+                a.0 += 10;
+            }
+        }
+        let mut seen: Vec<Entity> = changed.iter(&world).unwrap().collect();
+        seen.sort();
+        assert_eq!(seen, [ids[1], ids[3], ids[5]]);
+
+        // A query with `&mut A, Changed<A>` sees everything on its first call, then what changed
+        // since, but not its own writes.
+        for (_, mut a) in double.iter_mut(&mut world).unwrap() {
+            a.0 += 1;
+        }
+        world.insert(ids[4], A(0)).unwrap();
+        let rows: Vec<Entity> = double
+            .iter_mut(&mut world)
+            .unwrap()
+            .map(|(e, _)| e)
+            .collect();
+        assert_eq!(rows, [ids[4]]);
+        assert_eq!(changed.iter(&world).unwrap().count(), 6);
+        assert_eq!(changed.iter(&world).unwrap().count(), 0, "no writes since");
+    }
+
+    #[test]
+    fn masks_split_with_the_chunks() {
+        let pool =
+            ThreadPool::new(pragma_core::jobs::PoolConfig::default().with_workers(2)).unwrap();
+        let mut world = World::new();
+        let ids: Vec<Entity> = (0..50).map(|_| world.spawn().unwrap()).collect();
+        for (i, e) in (0_u32..).zip(&ids) {
+            world.insert(*e, A(i)).unwrap();
+            if i % 5 == 0 {
+                world.insert(*e, Marker).unwrap();
+            }
+        }
+        let mut changed = Query::<&mut A, Changed<A>>::new().unwrap();
+        changed
+            .par_for_each_mut(&mut world, &pool, Grain::Fixed(4), |_| {})
+            .unwrap();
+        for e in ids.iter().step_by(7) {
+            world.get_mut::<A>(*e).unwrap().0 += 1000;
+        }
+        let hits = std::sync::atomic::AtomicU32::new(0);
+        let mut reader = Query::<&A, Changed<A>>::new().unwrap();
+        reader.iter(&world).unwrap().for_each(drop);
+        changed
+            .par_for_each_mut(&mut world, &pool, Grain::Fixed(4), |a| {
+                assert!(a.0 >= 1000);
+                hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })
+            .unwrap();
+        assert_eq!(hits.into_inner(), 8);
+        reader
+            .par_for_each(&world, &pool, Grain::Fixed(3), |_| panic!("no change"))
+            .unwrap();
     }
 
     #[test]

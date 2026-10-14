@@ -1,7 +1,8 @@
 # Architecture
 
-Status: §2–3 are **implemented** (M1), queries in §4 too (M2), and systems, resources and
-schedules (M3); the rest is the **intended design**. Sections marked *open* are decided in the
+Status: §2–3 are **implemented** (M1), queries in §4 too (M2), systems, resources and
+schedules (M3), and commands, events and change detection (§4, M4); the rest is the **intended
+design**. Sections marked *open* are decided in the
 milestone named there and recorded in `DECISIONS.md`.
 
 ## 1. Place in the stack
@@ -34,6 +35,7 @@ World
 ├── archetypes: Vec<Archetype>    id = creation order; 0 is the empty set
 │     types:    [TypeId]          sorted, unique — the table's component set
 │     columns:  [Box<dyn Column>] parallel to `types`; each is a Vec<T>
+│                                  plus a Vec<ComponentTicks> (added, changed: u64, M4)
 │     entities: [Entity]          row → entity, parallel to every column
 │     add/remove edges            TypeId → neighbouring archetype (cache)
 └── by_types: HashMap<[TypeId], archetype id>
@@ -68,13 +70,14 @@ backed by benchmarks (M5).
 
 ```rust
 let mut movement = Query::<(&mut Position, &Velocity), Without<Frozen>>::new()?; // checks access
-for (position, velocity) in movement.iter_mut(&mut world)? { /* … */ }
-movement.par_for_each_mut(&mut world, &pool, Grain::Auto, |(position, velocity)| { /* … */ })?;
+for (mut position, velocity) in movement.iter_mut(&mut world)? { /* … */ } // Mut<Position>
+movement.par_for_each_mut(&mut world, &pool, Grain::Auto, |(mut position, velocity)| { /* … */ })?;
 ```
 
 - **Shape.** `Query<Q, F = ()>` is a state object that does not borrow the world. `Q`
-  (`QueryData`) is `&T`, `&mut T`, `Option<&T>`, `Entity` or a tuple of them (up to 8); `F`
-  (`QueryFilter`) is `With<T>`, `Without<T>` or a tuple. Read-only `Q` (`ReadOnlyQueryData`) also
+  (`QueryData`) is `&T`, `&mut T` (yielding `Mut<T>`, M4), `Option<&T>`, `Entity` or a tuple of
+  them (up to 8); `F` (`QueryFilter`) is `With<T>`, `Without<T>`, `Added<T>`, `Changed<T>` (M4)
+  or a tuple. Read-only `Q` (`ReadOnlyQueryData`) also
   iterates a shared `&World` (`iter`, `par_for_each`). Both traits are sealed: their machinery is
   internal.
 - **Declared access.** `Query::new` builds an `Access`: a sorted list of (component type, name,
@@ -121,7 +124,8 @@ schedule.run(&mut world, &pool)?;                      // every frame
 
 - **Systems.** A system is a plain function (or closure) of up to 8 parameters, each a sealed
   `SystemParam`: `View<Q, F>` (a query over the frame's world, the counterpart of `Query<Q, F>`
-  with the same archetype cache), `Res<T>` and `ResMut<T>`. It returns `()` or `Result<(), E>`
+  with the same archetype cache), `Res<T>`, `ResMut<T>`, and since M4 `Commands`,
+  `EventWriter<T>` and `EventReader<T>` (below). It returns `()` or `Result<(), E>`
   for any error type. Its `Access` is the union of its parameters' accesses, components and
   resources kept apart; a write together with another use of the same type in one system is
   rejected by `add_system` (`ConflictingAccess` / `ConflictingResourceAccess`). The parameters'
@@ -153,8 +157,8 @@ schedule.run(&mut world, &pool)?;                      // every frame
   table's `Vec<T>` with an empty one, and the slots grow (`try_reserve`) only when new tables
   appear — before anything is lent, so an `OutOfMemory` leaves the world untouched. After the
   frame, successful or not, the same swaps put everything back. Structural changes cannot
-  happen during a frame (systems get slices, never a `Vec` or `&mut World`); deferred commands
-  are M4.
+  happen during a frame (systems get slices, never a `Vec` or `&mut World`); systems record
+  them as deferred commands, applied at the sync point after the columns are back (below).
 - **A view during the frame.** `View<Q, F>` holds the read or write guards of its `Columns<T>`
   for the system's whole run, so the graph's locks are taken once per system, never per row; a
   lock is never waited on because the graph only runs non-conflicting systems together. The
@@ -177,6 +181,82 @@ of four systems over 100 000 entities (`movement`, `aging` and `health` parallel
 `energy` a sequential sum, all four independent) ≈ 274 µs on the schedule, against ≈ 565 µs for
 the same updates as sequential queries on the world; the fixed cost of a frame of four systems
 on an empty world (lending, the graph, returning) ≈ 5.4 µs.
+
+### Commands, events and the sync point (M4, DECISIONS #23–#26)
+
+```rust
+fn reap(mut bodies: View<(Entity, &Health)>, mut commands: Commands, mut deaths: EventWriter<Death>)
+    -> Result<(), EcsError>
+{
+    for (entity, health) in bodies.iter()? {
+        if health.0 <= 0.0 {
+            commands.despawn(entity)?;
+            commands.spawn()?.insert(Corpse)?;      // the id is allocated at the sync point
+            deaths.send(Death(entity))?;
+        }
+    }
+    Ok(())
+}
+fn mourn(mut deaths: EventReader<Death>) { for death in deaths.read() { /* next frame */ } }
+```
+
+- **Per-system buffers.** `Commands` and `EventWriter<T>` keep what they record in the system's
+  own state (next to its query caches), so they declare no access and never order systems; the
+  buffers keep their capacity between frames. A command queue is a list of operations plus one
+  typed lane per component type (`Vec<T>` behind one `Box<dyn …>`), so inserting a value is a
+  `try_reserve` + `push`, never a box per value.
+- **Deferred ids.** `Commands::spawn` returns an `EntityCommands` whose entity has no id yet;
+  later commands of the same queue address it by its spawn number. The id is allocated when the
+  queue is applied, which makes ids independent of which worker ran first.
+- **The sync point** ends `Schedule::run`, after the columns are returned (also after a failed
+  frame, not when the frame did not start): first every event type the schedule uses is updated,
+  then the deferred buffers of the systems that completed are applied, system after system in
+  registration order, parameter after parameter, command after command — the world's ordinary
+  operations, so each stays atomic. Several stages are several schedules.
+- **Failures.** A command on an entity that is gone does nothing (two systems despawning the
+  same entity is an ordinary race). Any other failure (out of memory) stops the application:
+  what was applied stays, the rest is discarded, and `run` returns
+  `EcsError::CommandFailed { system, source }`. A system that failed or panicked has its buffers
+  discarded.
+- **Events.** `Events<T>` is a world resource with two buffers and a running event id: `update`
+  drops the older buffer and keeps the newer one, so an event lives for two sync points. At the
+  sync point every writer's events are appended in registration order; an `EventReader<T>`
+  reads `Events<T>` (a resource read, it conflicts only with `ResMut<Events<T>>`) from a cursor
+  in its system's state. Readers see the events from the next frame on, each once; the schedule
+  creates `Events<T>` for every event type its systems use.
+
+### Change detection (M4, DECISIONS #27, #28)
+
+- **Ticks.** Every row of every column has an added and a changed tick (`u64`, never
+  wrapping), in two `Vec`s next to the values (separate, so that a write touches only the changed
+  ticks), moved and lent together with them. The world has a
+  change tick: every mutating world operation (`insert`, `get_mut`, a mutable query call) takes
+  a new one. A frame takes one tick per system — the frame's base plus the system's position in
+  the schedule's stable topological order — so two conflicting systems get ticks in the order
+  they really run, on any number of workers; the commands applied at the sync point come after
+  all of them.
+- **Writes.** `&mut T` yields a `Mut<'_, T>`: `DerefMut` stamps the row's changed tick with the
+  writer's tick, so only rows really written count as changed. `World::get_mut` stamps eagerly;
+  `insert` stamps added and changed for a new component, changed for a replacement.
+- **Filters.** `Added<T>` / `Changed<T>` keep rows whose tick is newer than the tick at which the
+  system (or, outside systems, the `Query`) last ran; the first run sees everything. They are row
+  filters: before the data columns are borrowed, the query fills a reusable mask (one byte per
+  row of the matching tables) from the tick columns with shared reads, and the iterators and the
+  parallel chunks skip the rows the mask clears. That is how `Query<&mut T, Changed<T>>` reads
+  and then writes the same tick column without `unsafe`; in a view the filter reads the ticks
+  through the data's own column guard when the data holds `T`. Table filters (`With`,
+  `Without`) cost nothing per row, as before.
+
+First numbers (`cargo bench -p pragma_ecs`, 8 logical cores, release, the same machine for
+M3 and M4): a sequential `(&mut Position, &Velocity)` query that writes every row ≈ 285 µs
+(M3: ≈ 195 µs), in parallel ≈ 213 µs (M3: ≈ 166 µs) — the write of the 8-byte changed tick next
+to 24 bytes of row data in a memory-bound loop; a read-only query is unchanged (≈ 122 µs). The
+frame of four systems ≈ 349 µs (M3: ≈ 272 µs). A `Changed<Position>` read over 100 000 rows
+costs ≈ 140 µs when nothing changed, ≈ 161 µs when 10 % did and ≈ 217 µs when all did, against
+≈ 122 µs without the filter. Spawning 10 000 entities with two components through commands
+≈ 3.1 ms against ≈ 2.5 ms directly (each command is an ordinary world operation, so a spawn
+moves the entity through `{}` → `{A}` → `{A, B}`); despawning ≈ 377 µs against ≈ 277 µs.
+Batching spawns into their final table is left to M5's benchmarks.
 
 ## 5. Reliability rules
 

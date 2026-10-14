@@ -100,8 +100,8 @@ proptest! {
         let (mut sequential, entities) = build(&specs);
         let mut query = Movement::new().unwrap();
         for _ in 0..rounds {
-            for (pos, vel) in query.iter_mut(&mut sequential).unwrap() {
-                step(pos, vel);
+            for (mut pos, vel) in query.iter_mut(&mut sequential).unwrap() {
+                step(&mut pos, vel);
             }
         }
         let expected = positions(&sequential, &entities);
@@ -120,7 +120,7 @@ proptest! {
                 let mut query = Movement::new().unwrap();
                 for _ in 0..rounds {
                     query
-                        .par_for_each_mut(&mut parallel, pool, grain, |(pos, vel)| step(pos, vel))
+                        .par_for_each_mut(&mut parallel, pool, grain, |(mut pos, vel)| step(&mut pos, vel))
                         .unwrap();
                 }
                 prop_assert_eq!(&positions(&parallel, &entities), &expected);
@@ -151,7 +151,7 @@ fn a_panicking_closure_is_an_error_and_the_other_chunks_still_run() {
         .collect();
     let (mut world, entities) = build(&specs);
     let mut query = Query::<&mut Pos>::new().unwrap();
-    let result = query.par_for_each_mut(&mut world, &pools()[1], Grain::Fixed(10), |pos| {
+    let result = query.par_for_each_mut(&mut world, &pools()[1], Grain::Fixed(10), |mut pos| {
         if pos.0 == 42 {
             panic!("bad row");
         }

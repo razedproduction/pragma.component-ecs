@@ -65,12 +65,12 @@ fn shift<const I: usize, const K: usize>(a: &mut C<I>, r: &R<K>) {
 fn mix_system<const I: usize, const J: usize>(
     mut rows: View<(&mut C<I>, &C<J>)>,
 ) -> Result<(), EcsError> {
-    rows.iter_mut()?.for_each(|(a, b)| mix(a, b));
+    rows.iter_mut()?.for_each(|(mut a, b)| mix(&mut a, b));
     Ok(())
 }
 
 fn bump_system<const I: usize>(mut rows: View<&mut C<I>>) -> Result<(), EcsError> {
-    rows.par_for_each_mut(Grain::Fixed(3), bump)
+    rows.par_for_each_mut(Grain::Fixed(3), |mut a| bump(&mut a))
 }
 
 fn absorb_system<const I: usize, const K: usize>(
@@ -86,7 +86,7 @@ fn shift_system<const I: usize, const K: usize>(
     mut rows: View<(&mut C<I>, Option<&u8>)>,
     r: Res<R<K>>,
 ) -> Result<(), EcsError> {
-    rows.iter_mut()?.for_each(|(a, _)| shift(a, &r));
+    rows.iter_mut()?.for_each(|(mut a, _)| shift(&mut a, &r));
     Ok(())
 }
 
@@ -94,12 +94,18 @@ fn shift_system<const I: usize, const K: usize>(
 
 fn mix_world<const I: usize, const J: usize>(world: &mut World) {
     let mut query = Query::<(&mut C<I>, &C<J>)>::new().unwrap();
-    query.iter_mut(world).unwrap().for_each(|(a, b)| mix(a, b));
+    query
+        .iter_mut(world)
+        .unwrap()
+        .for_each(|(mut a, b)| mix(&mut a, b));
 }
 
 fn bump_world<const I: usize>(world: &mut World) {
     let mut query = Query::<&mut C<I>>::new().unwrap();
-    query.iter_mut(world).unwrap().for_each(bump);
+    query
+        .iter_mut(world)
+        .unwrap()
+        .for_each(|mut a| bump(&mut a));
 }
 
 fn absorb_world<const I: usize, const K: usize>(world: &mut World) {
@@ -114,7 +120,10 @@ fn absorb_world<const I: usize, const K: usize>(world: &mut World) {
 fn shift_world<const I: usize, const K: usize>(world: &mut World) {
     let r = *world.resource::<R<K>>().unwrap();
     let mut query = Query::<&mut C<I>>::new().unwrap();
-    query.iter_mut(world).unwrap().for_each(|a| shift(a, &r));
+    query
+        .iter_mut(world)
+        .unwrap()
+        .for_each(|mut a| shift(&mut a, &r));
 }
 
 /// One generated system. Components 0..3, resources 0..2.
@@ -467,12 +476,12 @@ fn systems_with_disjoint_access_run_at_the_same_time() {
 fn integrate(mut bodies: View<(&mut Position, &Velocity)>) -> Result<(), EcsError> {
     bodies
         .iter_mut()?
-        .for_each(|(position, velocity)| position.0 += velocity.0);
+        .for_each(|(mut position, velocity)| position.0 += velocity.0);
     Ok(())
 }
 
 fn hurt(mut healths: View<&mut Health>, mut log: ResMut<Log>) -> Result<(), String> {
-    for health in healths.iter_mut().map_err(|e| e.to_string())? {
+    for mut health in healths.iter_mut().map_err(|e| e.to_string())? {
         health.0 -= 10;
         if health.0 < 0 {
             return Err(format!("health {} below zero", health.0));

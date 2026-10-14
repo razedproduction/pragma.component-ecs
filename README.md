@@ -13,19 +13,22 @@ caught when the schedule is built, not as a data race at run time.
 
 ## Status
 
-**M3 — systems and the vertical slice.** A `World` of generational `Entity` ids, components in
-archetype tables and resources; typed queries with declared access, sequential or parallel on
-the pragma.core thread pool; and systems — plain functions of `View`, `Res` and `ResMut`
-parameters — run by a `Schedule` as tasks of the pragma.core frame graph. Systems with disjoint
-access run in parallel; conflicting systems without an explicit order are rejected when the
-schedule is built. [`examples/ecs_sim`](examples/ecs_sim) runs a simulation through all of it and
-checks that the state hash of every tick is the same on 1, 2 and N workers. Commands, events and
-change detection come next. See the [roadmap](docs/roadmap.md) and the
+**M4 — commands, events, change detection.** A `World` of generational `Entity` ids,
+components in archetype tables and resources; typed queries with declared access, sequential or
+parallel on the pragma.core thread pool; and systems — plain functions of `View`, `Res`,
+`ResMut`, `Commands`, `EventWriter` and `EventReader` parameters — run by a `Schedule` as tasks
+of the pragma.core frame graph. Systems with disjoint access run in parallel; conflicting
+systems without an explicit order are rejected when the schedule is built. Structural changes
+from systems are deferred commands and events are published at the end of the frame, both in
+a fixed order; `Added<T>` / `Changed<T>` filters see what changed since a query or system last
+ran. [`examples/ecs_sim`](examples/ecs_sim) runs a simulation through all of it and checks that
+the state hash of every tick is the same on 1, 2 and N workers. Hardening (fuzzing, baseline
+benchmarks, semver checks) comes next. See the [roadmap](docs/roadmap.md) and the
 [architecture](docs/architecture.md).
 
 ```rust
 use pragma_core::prelude::{Grain, PoolConfig, ThreadPool};
-use pragma_ecs::{EcsError, Res, ResMut, Schedule, View, Without, World};
+use pragma_ecs::{Changed, Commands, EcsError, Entity, Res, ResMut, Schedule, View, Without, World};
 
 struct Position(f32, f32);
 struct Velocity(f32, f32);
@@ -38,7 +41,8 @@ fn movement(
     mut bodies: View<(&mut Position, &Velocity), Without<Frozen>>,
     dt: Res<Dt>,
 ) -> Result<(), EcsError> {
-    bodies.par_for_each_mut(Grain::Auto, |(position, velocity)| {
+    // `&mut Position` yields a `Mut<Position>`: writing it marks the position as changed.
+    bodies.par_for_each_mut(Grain::Auto, |(mut position, velocity)| {
         position.0 += velocity.0 * dt.0;
         position.1 += velocity.1 * dt.0;
     })
@@ -52,6 +56,20 @@ fn energy(mut velocities: View<&Velocity>, mut energy: ResMut<Energy>) -> Result
 
 fn render(_: View<&Position>) {}
 
+// Positions that changed since this system last ran; entities that left the arena are
+// despawned at the end of the frame, in a fixed order on any number of workers.
+fn bounds(
+    mut moved: View<(Entity, &Position), Changed<Position>>,
+    mut commands: Commands,
+) -> Result<(), EcsError> {
+    for (entity, position) in moved.iter()? {
+        if position.0.abs() > 1000.0 {
+            commands.despawn(entity)?;
+        }
+    }
+    Ok(())
+}
+
 let mut world = World::new();
 let entity = world.spawn()?;
 world.insert(entity, Position(0.0, 0.0))?;
@@ -64,6 +82,7 @@ builder.add_system("movement", movement)?;
 builder.add_system("energy", energy)?;
 // Without `after("movement")` the build fails with `EcsError::AmbiguousOrder`.
 builder.add_system_with("render", render, |c| c.after("movement"))?;
+builder.add_system_with("bounds", bounds, |c| c.after("movement"))?;
 let mut schedule = builder.build()?;
 
 let pool = ThreadPool::new(PoolConfig::default())?;

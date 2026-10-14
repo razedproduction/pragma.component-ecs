@@ -231,7 +231,7 @@ impl Harness {
             }
             Op::QueryAdd(v) => {
                 let mut visited = 0;
-                for (pos, tag) in self.queries.add.iter_mut(&mut self.world).unwrap() {
+                for (mut pos, tag) in self.queries.add.iter_mut(&mut self.world).unwrap() {
                     pos.0 = pos.0.wrapping_add(v).wrapping_add(i32::from(tag.is_some()));
                     visited += 1;
                 }
@@ -251,10 +251,15 @@ impl Harness {
                 let visited = Mutex::new(Vec::new());
                 self.queries
                     .par_add
-                    .par_for_each_mut(&mut self.world, pool(), Grain::Fixed(size), |(e, pos)| {
-                        pos.0 = pos.0.wrapping_add(v);
-                        visited.lock().unwrap().push(e);
-                    })
+                    .par_for_each_mut(
+                        &mut self.world,
+                        pool(),
+                        Grain::Fixed(size),
+                        |(e, mut pos)| {
+                            pos.0 = pos.0.wrapping_add(v);
+                            visited.lock().unwrap().push(e);
+                        },
+                    )
                     .unwrap();
                 let mut expected = Vec::new();
                 for (e, row) in &mut self.oracle {
