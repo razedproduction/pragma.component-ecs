@@ -31,6 +31,8 @@ pub fn pools() -> &'static [ThreadPool; 2] {
 pub enum On {
     InsertA(u32),
     InsertB(u32),
+    /// Inserts the bundle `(B, A)` (DECISIONS #35).
+    InsertBundle(u32, u32),
     RemoveA,
     RemoveB,
     Despawn,
@@ -41,6 +43,8 @@ pub enum On {
 pub enum Cmd {
     /// Spawns an entity and records the commands on it.
     Spawn(Vec<On>),
+    /// Spawns an entity with the bundle `(A, B)` and records the commands on it.
+    SpawnBundle(u32, u32, Vec<On>),
     /// Commands on one of the entities known before the frame (alive or not), by raw index.
     Existing(usize, On),
 }
@@ -59,13 +63,21 @@ pub struct Case {
 }
 
 fn decode_on(bytes: &mut Bytes<'_>) -> On {
-    match bytes.below(9) {
+    match bytes.below(11) {
         0..=2 => On::InsertA(bytes.u32()),
         3..=5 => On::InsertB(bytes.u32()),
         6 => On::RemoveA,
         7 => On::RemoveB,
+        8 | 9 => {
+            let b = bytes.u32();
+            On::InsertBundle(b, bytes.u32())
+        }
         _ => On::Despawn,
     }
+}
+
+fn decode_ons(bytes: &mut Bytes<'_>) -> Vec<On> {
+    (0..bytes.below(4)).map(|_| decode_on(bytes)).collect()
 }
 
 fn decode_option(bytes: &mut Bytes<'_>) -> Option<u32> {
@@ -84,11 +96,16 @@ pub fn decode(data: &[u8]) -> Case {
     for _ in 0..1 + usize::from(bytes.below(4)) {
         let mut cmds = Vec::new();
         for _ in 0..bytes.below(12) {
-            cmds.push(if bytes.below(4) == 0 {
-                Cmd::Spawn((0..bytes.below(4)).map(|_| decode_on(&mut bytes)).collect())
-            } else {
-                let i = bytes.index();
-                Cmd::Existing(i, decode_on(&mut bytes))
+            cmds.push(match bytes.below(6) {
+                0 => Cmd::Spawn(decode_ons(&mut bytes)),
+                1 => {
+                    let (a, b) = (bytes.u32(), bytes.u32());
+                    Cmd::SpawnBundle(a, b, decode_ons(&mut bytes))
+                }
+                _ => {
+                    let i = bytes.index();
+                    Cmd::Existing(i, decode_on(&mut bytes))
+                }
             });
         }
         systems.push(cmds);
@@ -106,9 +123,21 @@ fn record(entity: &mut EntityCommands<'_>, on: On) -> Result<(), EcsError> {
     match on {
         On::InsertA(v) => drop(entity.insert(A(v))?),
         On::InsertB(v) => drop(entity.insert(B(v))?),
+        On::InsertBundle(b, a) => drop(entity.insert_bundle((B(b), A(a)))?),
         On::RemoveA => drop(entity.remove::<A>()?),
         On::RemoveB => drop(entity.remove::<B>()?),
         On::Despawn => unreachable!("despawn consumes the builder"),
+    }
+    Ok(())
+}
+
+/// Records `ons` for a spawned entity, stopping at a despawn.
+fn record_all(mut entity: EntityCommands<'_>, ons: &[On]) -> Result<(), EcsError> {
+    for &on in ons {
+        if matches!(on, On::Despawn) {
+            return entity.despawn();
+        }
+        record(&mut entity, on)?;
     }
     Ok(())
 }
@@ -117,21 +146,14 @@ fn record(entity: &mut EntityCommands<'_>, on: On) -> Result<(), EcsError> {
 fn issue(commands: &mut Commands<'_>, cmds: &[Cmd], known: &[Entity]) -> Result<(), EcsError> {
     for cmd in cmds {
         match cmd {
-            Cmd::Spawn(ons) => {
-                let mut entity = commands.spawn()?;
-                for &on in ons {
-                    if matches!(on, On::Despawn) {
-                        entity.despawn()?;
-                        break;
-                    }
-                    record(&mut entity, on)?;
-                }
-            }
+            Cmd::Spawn(ons) => record_all(commands.spawn()?, ons)?,
+            Cmd::SpawnBundle(a, b, ons) => record_all(commands.spawn_bundle((A(*a), B(*b)))?, ons)?,
             Cmd::Existing(i, on) => {
                 let e = pick(known, *i).unwrap();
                 match on {
                     On::InsertA(v) => commands.insert(e, A(*v))?,
                     On::InsertB(v) => commands.insert(e, B(*v))?,
+                    On::InsertBundle(b, a) => commands.insert_bundle(e, (B(*b), A(*a)))?,
                     On::RemoveA => commands.remove::<A>(e)?,
                     On::RemoveB => commands.remove::<B>(e)?,
                     On::Despawn => commands.entity(e).despawn()?,
@@ -154,9 +176,20 @@ fn apply_on(world: &mut World, e: Entity, on: On) {
     match on {
         On::InsertA(v) => lenient(world.insert(e, A(v))),
         On::InsertB(v) => lenient(world.insert(e, B(v))),
+        On::InsertBundle(b, a) => lenient(world.insert_bundle(e, (B(b), A(a)))),
         On::RemoveA => lenient(world.remove::<A>(e)),
         On::RemoveB => lenient(world.remove::<B>(e)),
         On::Despawn => lenient(world.despawn(e)),
+    }
+}
+
+/// Applies `ons` to a spawned entity, stopping at a despawn.
+fn apply_all(world: &mut World, e: Entity, ons: &[On]) {
+    for &on in ons {
+        apply_on(world, e, on);
+        if matches!(on, On::Despawn) {
+            break;
+        }
     }
 }
 
@@ -166,12 +199,11 @@ fn apply_directly(world: &mut World, cmds: &[Cmd], known: &[Entity]) {
         match cmd {
             Cmd::Spawn(ons) => {
                 let e = world.spawn().unwrap();
-                for &on in ons {
-                    apply_on(world, e, on);
-                    if matches!(on, On::Despawn) {
-                        break;
-                    }
-                }
+                apply_all(world, e, ons);
+            }
+            Cmd::SpawnBundle(a, b, ons) => {
+                let e = world.spawn_bundle((A(*a), B(*b))).unwrap();
+                apply_all(world, e, ons);
             }
             Cmd::Existing(i, on) => apply_on(world, pick(known, *i).unwrap(), *on),
         }

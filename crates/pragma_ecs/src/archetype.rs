@@ -17,6 +17,9 @@ pub(crate) struct Archetype {
     /// Cached transitions: the archetype reached by adding / removing one component type.
     add_edges: HashMap<TypeId, usize>,
     remove_edges: HashMap<TypeId, usize>,
+    /// Cached transitions by bundle type: the archetype reached by inserting the bundle
+    /// (DECISIONS #35). From the empty archetype, the table a bundle spawns into.
+    bundle_edges: HashMap<TypeId, usize>,
 }
 
 impl Archetype {
@@ -30,6 +33,7 @@ impl Archetype {
             entities: Vec::new(),
             add_edges: HashMap::new(),
             remove_edges: HashMap::new(),
+            bundle_edges: HashMap::new(),
         }
     }
 
@@ -101,6 +105,18 @@ impl Archetype {
         self.remove_edges.get(&ty).copied()
     }
 
+    pub(crate) fn bundle_edge(&self, bundle: TypeId) -> Option<usize> {
+        self.bundle_edges.get(&bundle).copied()
+    }
+
+    /// Caches the transition by a bundle; skipped if out of memory, like
+    /// [`cache_edge`](Self::cache_edge).
+    pub(crate) fn cache_bundle_edge(&mut self, bundle: TypeId, target: usize) {
+        if self.bundle_edges.try_reserve(1).is_ok() {
+            self.bundle_edges.insert(bundle, target);
+        }
+    }
+
     /// Caches a transition. A cache is an optimization: running out of memory just skips it.
     pub(crate) fn cache_edge(&mut self, add: bool, ty: TypeId, target: usize) {
         let edges = if add {
@@ -143,6 +159,36 @@ impl Archetype {
             }
             None => false,
         }
+    }
+
+    /// Writes `value` at `row` of the column of `T`: replaces the component there (stamped as
+    /// changed at `tick`) or, if the column does not reach `row` yet, appends it (added and
+    /// changed at `tick`; callers reserve the room first). `false` if the table has no such
+    /// column.
+    pub(crate) fn put_component<T: Component>(&mut self, row: usize, value: T, tick: u64) -> bool {
+        let Some(column) = self.column_mut::<T>() else {
+            return false;
+        };
+        match column.get_mut(row) {
+            Some((slot, changed)) => {
+                *slot = value;
+                *changed = tick;
+            }
+            None => {
+                debug_assert_eq!(column.len(), row, "a bundle writes the next row");
+                column.push(value, tick, tick);
+            }
+        }
+        true
+    }
+
+    /// Whether every column has exactly one row per entity (a debug check).
+    pub(crate) fn is_aligned(&self) -> bool {
+        let rows = self.entities.len();
+        self.columns.iter().all(|column| {
+            let ticks = column.ticks();
+            ticks.added.len() == rows && ticks.changed.len() == rows
+        })
     }
 
     /// Removes `row` from the entity list (the last row takes its place) and returns the entity

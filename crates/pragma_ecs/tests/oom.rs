@@ -1,5 +1,6 @@
 //! Growing the world without memory yields `EcsError::OutOfMemory` and leaves the world
-//! unchanged, not an `abort`; despawning, lookups and moves into tables with room do not allocate.
+//! unchanged, not an `abort`; despawning, lookups and moves into tables with room do not allocate,
+//! bundles included (DECISIONS #35).
 //! Applying deferred commands without memory stops with `EcsError::CommandFailed`, keeping what
 //! was applied (DECISIONS #25).
 //!
@@ -158,6 +159,41 @@ fn queries_without_memory_fail_typed_and_a_warm_cache_does_not_allocate() {
         }
     });
     assert_eq!(world.get::<A>(e), Some(&A(3)));
+}
+
+#[test]
+fn bundles_without_memory_leave_the_world_unchanged_and_warm_ones_do_not_allocate() {
+    let mut world = World::new();
+    let e = world.spawn().unwrap();
+
+    // The {A, B} table does not exist yet.
+    assert!(matches!(
+        without_memory(|| world.spawn_bundle((A(1), B(1)))),
+        Err(EcsError::OutOfMemory { .. })
+    ));
+    assert!(matches!(
+        without_memory(|| world.insert_bundle(e, (A(1), B(1)))),
+        Err(EcsError::OutOfMemory { .. })
+    ));
+    assert_eq!(world.len(), 1);
+    assert_eq!((world.get::<A>(e), world.get::<B>(e)), (None, None));
+
+    // Warm: the table with room for several rows, the cached transitions of both bundles.
+    world.insert_bundle(e, (A(1), B(1))).unwrap();
+    world.insert_bundle(e, (A(2), B(2))).unwrap();
+    let spawned: Vec<_> = (0..3)
+        .map(|i| world.spawn_bundle((A(i), B(u64::from(i)))).unwrap())
+        .collect();
+    world.despawn(spawned[0]).unwrap();
+
+    without_memory(|| {
+        // Into the freed slot and row; a replacement in place.
+        let reused = world.spawn_bundle((A(7), B(7))).unwrap();
+        assert_eq!(reused.index(), spawned[0].index());
+        world.insert_bundle(e, (A(3), B(3))).unwrap();
+    });
+    assert_eq!(world.get::<A>(e), Some(&A(3)));
+    assert_eq!(world.len(), 4);
 }
 
 fn add_b_to_a(mut rows: View<(&mut A, &B)>) -> Result<(), EcsError> {

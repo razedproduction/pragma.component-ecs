@@ -2,12 +2,14 @@
 //!
 //! Queries are checked against the same oracle: after every operation each long-lived query
 //! (its archetype cache follows the world) yields exactly the entities and components the oracle
-//! computes, and mutating queries, sequential and parallel, change exactly those entities. The
+//! computes, and mutating queries, sequential and parallel, change exactly those entities.
+//! Bundles (DECISIONS #35) are spawned and inserted in several shapes, one with a duplicate type.
+//! The
 //! oracle (`common/world.rs`) is shared with the `world_ops` fuzz target (DECISIONS #30).
 
 mod common;
 
-use common::world::{Kind, Op, check, decode};
+use common::world::{Kind, Op, SHAPES, check, decode};
 use proptest::prelude::*;
 
 fn kind() -> impl Strategy<Value = Kind> {
@@ -28,6 +30,9 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (any::<usize>(), any::<i32>()).prop_map(|(i, v)| Op::Mutate(i, v)),
         1 => any::<i32>().prop_map(Op::QueryAdd),
         1 => (any::<i32>(), 1..8_usize).prop_map(|(v, size)| Op::ParAdd(v, size)),
+        2 => (0..SHAPES.len(), any::<i32>()).prop_map(|(s, v)| Op::SpawnBundle(s, v)),
+        2 => (any::<usize>(), 0..SHAPES.len(), any::<i32>())
+            .prop_map(|(i, s, v)| Op::InsertBundle(i, s, v)),
     ]
 }
 

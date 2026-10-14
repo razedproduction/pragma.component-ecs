@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pragma_core::graph::Resources;
 
 use crate::archetype::{Archetype, two_mut};
+use crate::bundle::{Bundle, BundleInfo, BundleRow, new_column};
 use crate::component::{Column, ColumnData, Component};
 use crate::entity::{Entities, Location};
 use crate::{EcsError, Entity, Event, Events, Res, Resource};
@@ -210,10 +211,7 @@ impl World {
     /// [`EcsError::OutOfMemory`] if storage cannot grow, [`EcsError::CapacityExhausted`] if the
     /// entity index space is used up. The world is unchanged in both cases.
     pub fn spawn(&mut self) -> Result<Entity, EcsError> {
-        if self.archetypes.is_empty() {
-            let created = self.push_archetype(Vec::new(), Vec::new())?;
-            debug_assert_eq!(created, EMPTY);
-        }
+        self.ensure_empty_table()?;
         let table = self
             .archetypes
             .get_mut(EMPTY)
@@ -226,6 +224,110 @@ impl World {
         })?;
         table.push_entity(entity);
         Ok(entity)
+    }
+
+    /// Creates an entity with the components of `bundle`, directly in the table of that
+    /// component set (DECISIONS #35): one table write instead of one move per
+    /// [`insert`](Self::insert). The components count as added and changed.
+    ///
+    /// ```
+    /// use pragma_ecs::{Query, World};
+    ///
+    /// #[derive(Debug, PartialEq)]
+    /// struct Position(f32, f32);
+    /// #[derive(Debug, PartialEq)]
+    /// struct Velocity(f32, f32);
+    ///
+    /// let mut world = World::new();
+    /// for i in 0..3 {
+    ///     world.spawn_bundle((Position(i as f32, 0.0), Velocity(1.0, 0.0)))?;
+    /// }
+    /// let tagged = world.spawn_bundle(("a name",))?; // a one-component bundle
+    /// assert_eq!(world.get::<&str>(tagged), Some(&"a name"));
+    ///
+    /// let mut moving = Query::<(&Position, &Velocity)>::new()?;
+    /// assert_eq!(moving.iter(&world)?.count(), 3);
+    /// # Ok::<(), pragma_ecs::EcsError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`EcsError::DuplicateComponent`] if the bundle holds a component type twice,
+    /// [`EcsError::OutOfMemory`] if storage cannot grow, [`EcsError::CapacityExhausted`] if the
+    /// entity index space is used up. The world is unchanged (except for a possibly created
+    /// empty table) and `bundle` is dropped.
+    pub fn spawn_bundle<B: Bundle>(&mut self, bundle: B) -> Result<Entity, EcsError> {
+        self.ensure_empty_table()?;
+        let to = self.bundle_target::<B>(EMPTY)?;
+        let tick = self.next_tick();
+        let table = self
+            .archetypes
+            .get_mut(to)
+            .ok_or(EcsError::CapacityExhausted)?;
+        table.reserve_row()?;
+        let row = table.len();
+        let entity = self.entities.alloc(Location { archetype: to, row })?;
+        // Nothing can fail from here on: the room is reserved.
+        bundle.write(&mut BundleRow::new(table, row, tick));
+        table.push_entity(entity);
+        debug_assert!(table.is_aligned(), "the bundle filled every column");
+        Ok(entity)
+    }
+
+    /// Attaches the components of `bundle` to `entity`, replacing those of the same types it
+    /// already has, in one move to the table of the resulting component set (DECISIONS #35).
+    ///
+    /// New components count as added and changed, replaced ones as changed; the replaced
+    /// values are dropped.
+    ///
+    /// ```
+    /// use pragma_ecs::World;
+    ///
+    /// #[derive(Debug, PartialEq)]
+    /// struct Health(u32);
+    /// struct Armor(u32);
+    ///
+    /// let mut world = World::new();
+    /// let knight = world.spawn_bundle((Health(10),))?;
+    /// world.insert_bundle(knight, (Health(100), Armor(5)))?;
+    /// assert_eq!(world.get::<Health>(knight), Some(&Health(100)));
+    /// assert!(world.get::<Armor>(knight).is_some());
+    /// # Ok::<(), pragma_ecs::EcsError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`EcsError::NoSuchEntity`] if `entity` is not alive, [`EcsError::DuplicateComponent`] if
+    /// the bundle holds a component type twice, [`EcsError::OutOfMemory`] if storage cannot
+    /// grow. On an error the world is unchanged and `bundle` is dropped.
+    pub fn insert_bundle<B: Bundle>(&mut self, entity: Entity, bundle: B) -> Result<(), EcsError> {
+        let missing = || EcsError::NoSuchEntity { entity };
+        let from = self.entities.location(entity).ok_or_else(missing)?;
+        let to = self.bundle_target::<B>(from.archetype)?;
+        let tick = self.next_tick();
+        if to == from.archetype {
+            // Every type is already there: replace in place.
+            let table = self.archetypes.get_mut(to).ok_or_else(missing)?;
+            bundle.write(&mut BundleRow::new(table, from.row, tick));
+            return Ok(());
+        }
+
+        let (source, dest) =
+            two_mut(&mut self.archetypes, from.archetype, to).ok_or_else(missing)?;
+        dest.reserve_row()?;
+        // Nothing can fail from here on: the room is reserved.
+        let row = dest.len();
+        let mut left_behind = 0_usize;
+        source.move_row(from.row, dest, |_, _| {
+            left_behind = left_behind.saturating_add(1);
+        });
+        debug_assert_eq!(left_behind, 0, "the target has every source column");
+        bundle.write(&mut BundleRow::new(dest, row, tick));
+        let row = dest.push_entity(entity);
+        debug_assert!(dest.is_aligned(), "the bundle filled every new column");
+        let swapped = source.swap_remove_entity(from.row);
+        self.settle(entity, Location { archetype: to, row }, swapped, from);
+        Ok(())
     }
 
     /// Destroys `entity` and drops its components. Does not allocate.
@@ -595,6 +697,67 @@ impl World {
         Ok(target)
     }
 
+    /// Creates the archetype of entities without components if the world has none yet.
+    fn ensure_empty_table(&mut self) -> Result<(), EcsError> {
+        if self.archetypes.is_empty() {
+            let created = self.push_archetype(Vec::new(), Vec::new())?;
+            debug_assert_eq!(created, EMPTY);
+        }
+        Ok(())
+    }
+
+    /// The archetype reached from `source` by inserting a bundle `B` (`source` itself if it
+    /// already has every type); created if it does not exist yet (DECISIONS #35).
+    fn bundle_target<B: Bundle>(&mut self, source: usize) -> Result<usize, EcsError> {
+        let key = TypeId::of::<B>();
+        let entities = self.entities.len();
+        let oom = |_| EcsError::OutOfMemory { entities };
+        let table = self
+            .archetypes
+            .get(source)
+            .ok_or(EcsError::CapacityExhausted)?;
+        if let Some(target) = table.bundle_edge(key) {
+            return Ok(target);
+        }
+
+        let info = BundleInfo::of::<B>(entities)?;
+        // The union of two sorted, unique lists.
+        let mut types = Vec::new();
+        types
+            .try_reserve_exact(table.types().len().saturating_add(B::COUNT))
+            .map_err(oom)?;
+        types.extend_from_slice(table.types());
+        for (ty, _) in info.components() {
+            if let Err(position) = types.binary_search(&ty) {
+                types.insert(position, ty);
+            }
+        }
+
+        let target = if types.as_slice() == table.types() {
+            source
+        } else if let Some(&target) = self.by_types.get(types.as_slice()) {
+            target
+        } else {
+            let mut columns: Vec<Box<dyn Column>> = Vec::new();
+            columns.try_reserve_exact(types.len()).map_err(oom)?;
+            for ty in &types {
+                let column = match table.types().binary_search(ty) {
+                    Ok(i) => table.columns().get(i).map(|column| column.empty()),
+                    Err(_) => info
+                        .components()
+                        .find(|(t, _)| t == ty)
+                        .map(|(_, new)| new()),
+                };
+                columns.push(column.ok_or(EcsError::CapacityExhausted)?);
+            }
+            self.push_archetype(types, columns)?
+        };
+        if let Some(table) = self.archetypes.get_mut(source) {
+            table.cache_bundle_edge(key, target);
+        }
+        Ok(target)
+    }
+
     /// Adds an archetype table for `types` (sorted, unique) and returns its id.
     fn push_archetype(
         &mut self,
@@ -614,10 +777,6 @@ impl World {
         self.archetypes.push(Archetype::new(types, columns));
         Ok(id)
     }
-}
-
-fn new_column<T: Component>() -> Box<dyn Column> {
-    Box::new(ColumnData::<T>::default())
 }
 
 #[cfg(test)]
@@ -671,6 +830,50 @@ mod tests {
         world.remove::<B>(a).unwrap();
         world.remove::<A>(b).unwrap();
         assert_eq!(world.archetypes.len(), 4);
+    }
+
+    #[test]
+    fn bundles_go_straight_to_their_final_table() {
+        let mut world = World::new();
+        let a = world.spawn_bundle((A(1), B("a"))).unwrap();
+        // {} and {A, B} only: no intermediate tables.
+        assert_eq!(world.archetypes.len(), 2);
+        let b = world.spawn_bundle((B("b"), A(2))).unwrap();
+        assert_eq!(
+            world.archetypes.len(),
+            2,
+            "the order in the tuple does not matter"
+        );
+        let empty = world.spawn_bundle(()).unwrap();
+        assert_eq!(world.entities.location(empty).unwrap().archetype, EMPTY);
+
+        // Replace one, add one: a single move to {A, B, Marker}.
+        world.insert_bundle(a, (A(10), Marker)).unwrap();
+        assert_eq!(world.archetypes.len(), 3);
+        assert_eq!(
+            (world.get::<A>(a), world.get::<B>(a), world.get::<Marker>(a)),
+            (Some(&A(10)), Some(&B("a")), Some(&Marker))
+        );
+        // `b` took `a`'s old row.
+        assert_eq!(world.get::<A>(b), Some(&A(2)));
+        // Every type present: replaced in place, no move.
+        world.insert_bundle(b, (A(20), B("bb"))).unwrap();
+        assert_eq!(world.get::<B>(b), Some(&B("bb")));
+        world.insert_bundle(empty, (Marker,)).unwrap();
+        assert_eq!(world.archetypes.len(), 4);
+
+        let dup = Err(EcsError::DuplicateComponent {
+            component: std::any::type_name::<A>(),
+        });
+        assert_eq!(world.spawn_bundle((A(0), A(1))).map(drop), dup.clone());
+        assert_eq!(world.insert_bundle(a, (A(0), Marker, A(1))), dup);
+        assert_eq!(world.len(), 3);
+        world.despawn(a).unwrap();
+        assert_eq!(
+            world.insert_bundle(a, (Marker,)),
+            Err(EcsError::NoSuchEntity { entity: a })
+        );
+        assert!(world.archetypes.iter().all(Archetype::is_aligned));
     }
 
     #[test]

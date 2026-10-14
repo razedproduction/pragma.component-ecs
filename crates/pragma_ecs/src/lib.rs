@@ -51,6 +51,7 @@
 
 mod access;
 mod archetype;
+mod bundle;
 mod change;
 mod command;
 mod component;
@@ -66,6 +67,7 @@ mod system;
 mod world;
 
 pub use access::{Access, AccessKind};
+pub use bundle::Bundle;
 pub use change::Mut;
 pub use command::{Commands, EntityCommands};
 pub use component::Component;

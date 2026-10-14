@@ -1,7 +1,8 @@
 //! Deferred commands (DECISIONS #23–#25).
 //!
-//! The property test gives several systems random command lists (spawning with commands on the
-//! new entity, despawning, inserting and removing on live, stale and same-frame-despawned
+//! The property test gives several systems random command lists (spawning, also with a bundle,
+//! with commands on the new entity, despawning, inserting components and bundles and removing
+//! on live, stale and same-frame-despawned
 //! entities), runs them through a schedule on 1 and 4 workers, and checks that the world (entity
 //! ids included) equals the same operations applied directly to the world, system after system
 //! in registration order, with operations on dead entities ignored. The oracle
@@ -26,6 +27,7 @@ fn on() -> impl Strategy<Value = On> {
         3 => any::<u32>().prop_map(On::InsertB),
         1 => Just(On::RemoveA),
         1 => Just(On::RemoveB),
+        2 => any::<(u32, u32)>().prop_map(|(b, a)| On::InsertBundle(b, a)),
         1 => Just(On::Despawn),
     ]
 }
@@ -33,6 +35,8 @@ fn on() -> impl Strategy<Value = On> {
 fn cmd() -> impl Strategy<Value = Cmd> {
     prop_oneof![
         1 => proptest::collection::vec(on(), 0..4).prop_map(Cmd::Spawn),
+        1 => (any::<(u32, u32)>(), proptest::collection::vec(on(), 0..4))
+            .prop_map(|((a, b), ons)| Cmd::SpawnBundle(a, b, ons)),
         3 => (any::<usize>(), on()).prop_map(|(i, o)| Cmd::Existing(i, o)),
     ]
 }
