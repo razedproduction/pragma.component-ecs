@@ -9,7 +9,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 | Milestone | Version | Essence | Status |
 |---|---|---|---|
 | M0 | 0.0.1 | Repository foundation | ✅ |
-| M1 | 0.1.0 | Entities and component storage | 📋 |
+| M1 | 0.1.0 | Entities and component storage | 🚧 |
 | M2 | 0.2.0 | Queries | 📋 |
 | M3 | 0.3.0 | Systems on the pragma.core frame graph, vertical slice | 📋 |
 | M4 | 0.4.0 | Commands, events, change detection | 📋 |
@@ -26,14 +26,17 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] `pragma_ecs` skeleton with `EcsError`, depending on `pragma_core` 1.x
 - [x] Docs: README, architecture, roadmap, DECISIONS, CONTRIBUTING, CHANGELOG
 
-## M1 — Entities and storage (0.1.0)
+## M1 — Entities and storage (0.1.0) 🚧
 
-- [ ] **Decision:** storage model (archetype tables / sparse sets / hybrid) — see `docs/architecture.md`
-- [ ] **Decision:** whether `unsafe` is needed for type-erased columns, and in which crate (DECISIONS #6)
-- [ ] `Entity`: generational id (index + generation), stale ids are detected
-- [ ] `World`: `spawn`, `despawn`, `insert`, `remove`, `get`, `get_mut`
-- [ ] Bounded allocations: growth via `try_reserve` → `EcsError::OutOfMemory`
-- [ ] Property tests against a naive `HashMap<Entity, components>` oracle
+All items are done; the milestone closes with the 0.1.0 version bump.
+
+
+- [x] **Decision:** storage model — archetype tables (DECISIONS #8, `docs/architecture.md` §3)
+- [x] **Decision:** no `unsafe`: columns are `Box<dyn Column>` over `Vec<T>` (DECISIONS #9); own entity allocator (#10)
+- [x] `Entity`: generational id (index + generation), stale ids are detected
+- [x] `World`: `spawn`, `despawn`, `insert`, `remove`, `get`, `get_mut`
+- [x] Bounded allocations: growth via `try_reserve` → `EcsError::OutOfMemory` (`tests/oom.rs`, DECISIONS #11)
+- [x] Property tests against a naive `HashMap<Entity, components>` oracle (`tests/oracle.rs`)
 
 ## M2 — Queries (0.2.0)
 

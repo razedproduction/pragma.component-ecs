@@ -15,6 +15,7 @@ pragma_ecs = 0   # entities, components, storage, queries, systems on the pragma
 # The `unsafe` budget: the exact number of occurrences of the keyword in a file's code and the
 # decisions that allowed them. Growth only with a new entry in DECISIONS.md.
 [unsafe_budget]
+"crates/pragma_ecs/tests/oom.rs" = { count = 7, decisions = [11] }
 
 # Deliberately accepted exceptions to the "no C/C++" rule.
 [purity.accepted]
