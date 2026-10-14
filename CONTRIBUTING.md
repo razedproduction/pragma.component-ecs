@@ -8,7 +8,15 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 python tools/audit_workspace.py .
 cargo deny check
+cargo run --release -p ecs_sim -- --suite
 ```
+
+If the simulation's behaviour changes on purpose, regenerate the golden hashes with
+`cargo run --release -p ecs_sim -- --suite --ticks 200 --bless` (and `--ticks 3000`) and
+explain the change in the PR. A property of the world gets its oracle in
+`crates/pragma_ecs/tests/common/`, used by both a proptest and a fuzz target in `fuzz/`
+(`cargo +nightly fuzz run <target>`, Linux). Breaking the public API needs a version bump:
+CI runs `cargo semver-checks` against `main`, and the bench gate fails a regression above 10 %.
 
 ## Module contract
 

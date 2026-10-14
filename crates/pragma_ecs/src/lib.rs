@@ -1,7 +1,7 @@
 //! An Entity Component System for game engines and frameworks built on
 //! [`pragma_core`](https://docs.rs/pragma_core).
 //!
-//! The crate is at milestone M4: entities, component storage, queries, systems, commands,
+//! The crate is at milestone M5 (hardening): entities, component storage, queries, systems, commands,
 //! events and change detection. A [`World`] holds entities ([`Entity`], generational ids), their
 //! components (any `Send + Sync + 'static` type, see [`Component`]) in archetype tables, and
 //! resources (singletons, see [`Resource`]). A [`Query`] iterates the entities that have the

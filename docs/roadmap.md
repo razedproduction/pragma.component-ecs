@@ -13,7 +13,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 | M2 | 0.2.0 | Queries | 🚧 |
 | M3 | 0.3.0 | Systems on the pragma.core frame graph, vertical slice | 🚧 |
 | M4 | 0.4.0 | Commands, events, change detection | 🚧 |
-| M5 | 0.5.0 | Hardening: determinism, fuzz, benches, semver | 📋 |
+| M5 | 0.5.0 | Hardening: determinism, fuzz, benches, semver | 🚧 |
 | M6 | 1.0.0 | Stable API, publication | 📋 |
 
 ---
@@ -82,16 +82,26 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] Benchmarks: command application (`benches/commands.rs`), change-detection overhead
   (`benches/change.rs`)
 
-## M5 — Hardening (0.5.0)
+## M5 — Hardening (0.5.0) 🚧
 
-- [ ] Determinism suite in CI
-- [ ] Fuzzing of world operations against the oracle
-- [ ] Benchmarks against `hecs` / `bevy_ecs` as a baseline (dev only), bench gate
-- [ ] `cargo-semver-checks` in CI
+- [x] **Decisions:** a determinism suite with committed golden hashes (DECISIONS #29), cargo-fuzz
+  in a separate workspace over the shared oracles (#30), a separate `baseline/` workspace with
+  `hecs` and `bevy_ecs` (#31), an A/B bench gate (#32), semver-checks against `main` and the
+  version 0.5.0 (#33), no change to storage or ticks after the benchmarks, bundles to M6 (#34)
+- [x] Determinism suite in CI: `ecs_sim --suite`, seven scenarios on 1, 2 and N workers against
+  `examples/ecs_sim/golden.txt`, Windows and Linux on every PR (200 ticks) and nightly (3000)
+- [x] Fuzzing of world operations against the oracle: `fuzz/` targets `world_ops`, `commands`,
+  `change_ticks` over the oracles in `crates/pragma_ecs/tests/common/`, shared with proptest
+  (60 s per PR, 10 min nightly with a kept corpus)
+- [x] Benchmarks against `hecs` / `bevy_ecs` as a baseline (dev only, `baseline/`), bench gate
+  (`tools/bench_gate.py`, PRs on Windows and Linux)
+- [x] `cargo-semver-checks` in CI (PRs, baseline `main`)
 
 ## M6 — 1.0 (1.0.0)
 
 - [ ] API review, rustdoc with examples, an "Integrating into an engine" section
+- [ ] Bundle spawns into the final table, for `World` and `Commands` (DECISIONS #34: spawning
+  is the largest gap to `hecs` / `bevy_ecs` in the M5 baseline)
 - [ ] Publication on crates.io
 
 ---

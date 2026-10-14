@@ -6,6 +6,23 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ### Added
 
+- Hardening (M5, DECISIONS #29–#33):
+  - the determinism suite `ecs_sim --suite [--bless] [--golden FILE]`: seven scenarios
+    (default, odd count, empty world, single entity, several tables, a lethal hazard heavy with
+    commands and events, a calm arena) on 1, 2 and N workers, checked against committed golden
+    hashes (`examples/ecs_sim/golden.txt`); in CI on Windows and Linux for every PR (200 ticks)
+    and nightly (3000 ticks). `ecs_sim` gains `SimConfig::lethality` / `fragments`, the
+    `Hazard` resource, `--seed`, `--lethality`, `--fragments`, ms/tick in its report, and the
+    suite API (`determinism_suite`, `run_suite`, `history`, golden parsing and checking);
+  - fuzzing with cargo-fuzz in a separate `fuzz/` workspace: `world_ops`, `commands` and
+    `change_ticks` over the oracles of the property tests, now shared in
+    `crates/pragma_ecs/tests/common/` (60 s per target in PRs, 10 minutes nightly);
+  - baseline benchmarks against `hecs` 0.11 and `bevy_ecs` 0.20 in a separate `baseline/`
+    workspace (spawn, iteration, fragmented iteration, add/remove, despawn);
+  - CI: a bench gate (`tools/bench_gate.py`, an interleaved A/B of the PR base and head),
+    `cargo semver-checks` against `main`, a `changes` job that skips the heavy jobs on
+    documentation-only PRs, and a nightly workflow.
+
 - Deferred commands (M4, DECISIONS #23–#25): the system parameter `Commands` (`spawn`,
   `entity`, `despawn`, `insert`, `remove`, `len`, `is_empty`) and `EntityCommands` (`id`,
   `insert`, `remove`, `despawn`, chaining). Commands are kept per system, declare no access, and
@@ -75,6 +92,7 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ### Changed
 
+- The workspace version is 0.5.0 (DECISIONS #33; not released yet, the last tag is v0.1.0).
 - **Breaking:** `&mut T` in a `Query` or a `View` yields `Mut<'_, T>` instead of `&mut T`
   (DECISIONS #28); field access and methods work through auto-deref, a function taking `&mut T`
   needs `&mut *item`. `World::get_mut` and replacing a component with `World::insert` mark it
