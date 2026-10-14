@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "pragma_ecs"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "pragma_core",
  "proptest",
