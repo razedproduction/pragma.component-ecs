@@ -4,6 +4,29 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ## [Unreleased]
 
+## [1.0.1] - Unreleased
+
+A patch release: no change to the public API (DECISIONS #40).
+
+### Fixed
+
+- `World::send_event` for the first event of a type no longer aborts the process when memory
+  runs out: the event's buffer is reserved before the `Events<T>` resource is created, so the
+  call returns `EcsError::OutOfMemory`, as documented, and leaves the world without an empty
+  `Events<T>`.
+
+### Added
+
+- Tests: events against a naive two-buffer model (`tests/common/events.rs`): writer and reader
+  systems, readers skipping frames, `World::send_event`, manual updates and outside cursors,
+  on 1 and 4 workers, as a property test and the new fuzz target `events` (60 s per PR,
+  10 minutes nightly); `send_event` without memory in `tests/oom.rs`.
+
+### Changed
+
+- CI: the MSRV job runs the workspace tests on Rust 1.88 instead of only `cargo check`.
+- Docs: the semver note in `docs/architecture.md` §6 reflects the published 1.0.0.
+
 ## [1.0.0] - 2026-10-15
 
 The first crates.io release (M6, DECISIONS #39): everything since 0.1.0, milestones M2–M6
