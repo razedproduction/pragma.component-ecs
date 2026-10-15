@@ -347,7 +347,9 @@ tools/bench_gate.py               A/B of PR base and head, normalized by a refer
   longer start a few bytes apart modulo 4096. With the same padding experiment the 8-table loop
   takes 294–312 µs over 24 processes (before: 456–661 µs), the speed of one table, and the
   gate measures 428 → 270 µs against `main`; `query_8_tables` is an ordinary gated measurement
-  again.
+  again. Both sides of the gate are built with `-C llvm-args=-align-loops=64` (DECISIONS #43):
+  on AMD Zen 4 and Intel runners the placement of a hot loop alone moved
+  `change/mut_write_all` between ≈ 83 and ≈ 110 µs for the same source.
 - **Semver.** `cargo semver-checks -p pragma_ecs` against the PR base: a breaking change needs a
   version bump (the version is 0.5.0 since M5).
 
