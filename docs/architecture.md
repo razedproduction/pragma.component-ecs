@@ -291,8 +291,9 @@ typed `#[non_exhaustive]` errors, pure-Rust dependencies, layers checked by `too
 ## 6. Hardening (M5, DECISIONS #29–#34)
 
 ```
-crates/pragma_ecs/tests/common/   oracles: world (HashMap), commands (direct ops), change (ticks)
-   ├── tests/oracle.rs, commands.rs, change.rs   proptest strategies + decoded random bytes
+crates/pragma_ecs/tests/common/   oracles: world (HashMap), commands (direct ops), change (ticks),
+   │                                 events (two buffers, 1.0.1)
+   ├── tests/oracle.rs, commands.rs, change.rs, events.rs   proptest + decoded random bytes
    └── fuzz/fuzz_targets/*.rs                     cargo-fuzz, separate workspace (C++ libFuzzer)
 examples/ecs_sim --suite          7 scenarios × {1, 2, N} workers, golden.txt
 baseline/                         pragma_ecs vs hecs vs bevy_ecs, separate workspace
@@ -312,7 +313,9 @@ tools/bench_gate.py               A/B of PR base and head, normalized by a refer
   harness that applies them to the world and to the naive model and panics on the first
   disagreement, and a decoder from bytes. The property tests generate operations with proptest
   strategies and also feed random bytes through the decoder; the fuzz targets `world_ops`,
-  `commands`, `change_ticks` include the same module through `#[path]`. libFuzzer does not link
+  `commands`, `change_ticks` and `events` (1.0.1, DECISIONS #40: writer and reader systems,
+  readers skipping frames, sends, updates and reads between frames against a naive model of
+  the two buffers) include the same module through `#[path]`. libFuzzer does not link
   on Windows, so the targets run on Linux (60 s per PR, 10 min nightly with the corpus kept in
   the Actions cache); on Windows the same oracles run through proptest.
 - **Bench gate.** In a PR, the base and the head are built into separate target directories
@@ -349,9 +352,15 @@ tools/bench_gate.py               A/B of PR base and head, normalized by a refer
   gate measures 428 → 270 µs against `main`; `query_8_tables` is an ordinary gated measurement
   again. Both sides of the gate are built with `-C llvm-args=-align-loops=64` (DECISIONS #43):
   on AMD Zen 4 and Intel runners the placement of a hot loop alone moved
-  `change/mut_write_all` between ≈ 83 and ≈ 110 µs for the same source.
+  `change/mut_write_all` between ≈ 83 and ≈ 110 µs for the same source. Each measurement runs in
+  a process of its own, on Linux with `MALLOC_ARENA_MAX=1` (DECISIONS #44): glibc's per-thread
+  arenas and the heap left by earlier benchmarks flipped `commands/spawn_commands` between
+  ≈ 1.5 and ≈ 2.0 ms per process. Bundle spawning still lands in one of two modes per process
+  (neither thread placement nor ASLR), so each measurement's own process-to-process spread is
+  added to its limit.
 - **Semver.** `cargo semver-checks -p pragma_ecs` against the PR base: a breaking change needs a
-  version bump (the version is 0.5.0 since M5).
+  version bump. Since 1.0.0 is published, that means 2.0.0; 1.x patches only fix and minor
+  releases only add.
 
 Baseline numbers (`cargo bench --manifest-path baseline/Cargo.toml --bench baseline`, 8 logical
 cores, Windows, release, medians; M5 = 0.5.0, the rest measured on 1.0.0 in one run):

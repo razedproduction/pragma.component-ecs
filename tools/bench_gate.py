@@ -14,14 +14,17 @@ A regression is computed as follows:
                operations, a plain read in the same bench): the change does not affect it, so
                its shift is runner noise;
   normalized = ratio / ref_ratio.
-A measurement with a reference fails if ratio > 1 + threshold AND normalized > 1 + threshold.
+A measurement with a reference fails if ratio > limit AND normalized > limit, where
+limit = 1 + threshold + spread and spread is the measurement's own process-to-process spread
+(max / min − 1 over the rounds of each revision, the larger of the two; DECISIONS #44).
 A measurement without a reference (ecs_sim ms/tick) fails if ratio > 1 + threshold + noise, where
 noise is its own noise: median / minimum − 1 over the runs of each revision, the larger of the two.
 
 A measurement missing on the base revision (a new benchmark) is reported, not gated.
 
 Both revisions are built with `-C llvm-args=-align-loops=64` added to RUSTFLAGS (DECISIONS #43),
-so that code placement does not decide a measurement.
+so that code placement does not decide a measurement. Every measurement runs in its own process,
+and on Linux with MALLOC_ARENA_MAX=1 (DECISIONS #44), so that the allocator state does not either.
 
 Usage:
   python3 tools/bench_gate.py --base <base worktree> --head <head worktree>
@@ -65,6 +68,15 @@ REFERENCES = {
     "change/read_changed_all/100000": "change/read_plain/100000",
     "change/mut_write_all/100000": "change/mut_read_only/100000",
 }
+# Every measurement the gate uses (gated ones and their references) with its bench target; each
+# runs in a process of its own (DECISIONS #44).
+MEASUREMENTS = [
+    (package, bench, bench_id)
+    for bench_id in sorted(set(REFERENCES) | set(REFERENCES.values()))
+    for package, bench, pattern in BENCHES
+    if re.match(pattern, bench_id)
+]
+
 # Both sides are built with hot loops aligned to 64 bytes (DECISIONS #43): otherwise where a
 # loop lands in the binary decides some measurements on a shared runner (change/mut_write_all
 # 83 vs 110 µs on AMD Zen 4 and Intel for the same source), and any unrelated code change moves it.
@@ -84,6 +96,8 @@ class Side:
         env = dict(os.environ)
         env["CARGO_TARGET_DIR"] = str(self.target)
         env["RUSTFLAGS"] = f"{env.get('RUSTFLAGS', '')} {ALIGN_LOOPS}".strip()
+        if sys.platform.startswith("linux"):
+            env["MALLOC_ARENA_MAX"] = "1"  # DECISIONS #44
         return env
 
 
@@ -137,9 +151,14 @@ def build(side: Side) -> None:
 def measure(side: Side, samples: dict[str, list[float]]) -> dict[str, float]:
     """The measurements of one round; every ecs_sim run is appended to `samples` (for the noise estimate)."""
     results: dict[str, float] = {}
-    for package, bench, pattern in BENCHES:
+    # One process per measurement (DECISIONS #44): the allocator state left by the benchmarks
+    # run before it in the same process must not decide a measurement.
+    for package, bench, bench_id in MEASUREMENTS:
         run(
-            ["cargo", "bench", "-p", package, "--bench", bench, "--", pattern, *CRITERION_ARGS],
+            [
+                "cargo", "bench", "-p", package, "--bench", bench, "--",
+                f"^{re.escape(bench_id)}$", *CRITERION_ARGS,
+            ],
             side,
         )
     results.update(criterion_results(side))
@@ -172,6 +191,12 @@ def spread(values: list[float]) -> float:
     """A revision's noise from its own runs: median / minimum − 1 (a single outlier does not inflate it)."""
     ordered = sorted(values)
     return ordered[len(ordered) // 2] / ordered[0] - 1.0
+
+
+def process_spread(rounds: list[dict[str, float]], key: str) -> float:
+    """How far one revision's runs of `key` (one process each) lie apart: max / min − 1 (DECISIONS #44)."""
+    values = [r[key] for r in rounds if key in r]
+    return max(values) / min(values) - 1.0 if values else 0.0
 
 
 def best(rounds: list[dict[str, float]]) -> dict[str, float]:
@@ -238,8 +263,12 @@ def main() -> int:
         ref = REFERENCES.get(key)
         if ref in ref_ratios:
             normalized = ratio / ref_ratios[ref]
-            failed = ratio > limit and normalized > limit
-            note = f"{ref_ratios[ref]:.3f} ({ref.split('/', 2)[1]})"
+            # A measurement that lands in a different mode per process (DECISIONS #44) cannot be
+            # gated tighter than its own process-to-process spread.
+            spread_k = max(process_spread(rounds["base"], key), process_spread(rounds["head"], key))
+            key_limit = limit + spread_k
+            failed = ratio > key_limit and normalized > key_limit
+            note = f"{ref_ratios[ref]:.3f} ({ref.split('/', 2)[1]}); limit {key_limit:.3f}"
         else:
             normalized = ratio
             key_noise = own_noise.get(key, noise)

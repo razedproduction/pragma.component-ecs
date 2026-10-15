@@ -5,6 +5,7 @@
 #   cargo +nightly fuzz run world_ops
 #   cargo +nightly fuzz run commands
 #   cargo +nightly fuzz run change_ticks
+#   cargo +nightly fuzz run events
 
 [package]
 name = "pragma_ecs_fuzz"
@@ -37,6 +38,13 @@ bench = false
 [[bin]]
 name = "change_ticks"
 path = "fuzz_targets/change_ticks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "events"
+path = "fuzz_targets/events.rs"
 test = false
 doc = false
 bench = false

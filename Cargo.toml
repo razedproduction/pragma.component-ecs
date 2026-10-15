@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "examples/*"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.2"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -14,7 +14,7 @@ categories = ["game-development", "data-structures", "concurrency"]
 
 [workspace.dependencies]
 # Internal crates: exact versions (lockstep), as in pragma.core (DECISIONS.md #4).
-pragma_ecs = { path = "crates/pragma_ecs", version = "=1.0.0" }
+pragma_ecs = { path = "crates/pragma_ecs", version = "=1.0.2" }
 
 # The runtime core this component is built on (DECISIONS.md #2).
 pragma_core = { version = "1.0.0", default-features = false }

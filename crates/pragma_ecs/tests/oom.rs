@@ -2,7 +2,8 @@
 //! unchanged, not an `abort`; despawning, lookups and moves into tables with room do not allocate,
 //! bundles included (DECISIONS #35).
 //! Applying deferred commands without memory stops with `EcsError::CommandFailed`, keeping what
-//! was applied (DECISIONS #25).
+//! was applied (DECISIONS #25). `World::send_event` without memory drops the event and creates no
+//! resource (DECISIONS #40).
 //!
 //! A separate test binary with a failing global allocator (DECISIONS.md #11).
 // Test code: a panic is a test failure.
@@ -12,7 +13,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use pragma_core::prelude::{PoolConfig, ThreadPool};
-use pragma_ecs::{Commands, EcsError, Query, Res, Schedule, View, World};
+use pragma_ecs::{Commands, EcsError, Events, Query, Res, Schedule, View, World};
 
 /// The system allocator, refusing every allocation on a thread that has `FAIL` raised, or the
 /// next `REFUSE` allocations on that thread.
@@ -285,6 +286,36 @@ fn commands_without_memory_stop_with_command_failed_and_keep_what_was_applied() 
     schedule.run(&mut world, &pool).unwrap();
     assert_eq!(world.get::<A>(first), Some(&A(4)));
     assert_eq!(world.get::<B>(second), Some(&B(3)));
+}
+
+struct Ping(u32);
+
+#[test]
+fn send_event_without_memory_drops_the_event_and_leaves_the_world_unchanged() {
+    let mut world = World::new();
+    // The first event: its buffer is reserved before the resource is created (DECISIONS #40),
+    // so the world gets no empty `Events<Ping>`.
+    assert!(matches!(
+        without_memory(|| world.send_event(Ping(0))),
+        Err(EcsError::OutOfMemory { .. })
+    ));
+    assert!(!world.contains_resource::<Events<Ping>>());
+
+    world.send_event(Ping(1)).unwrap();
+    // Into the buffer's spare capacity until it is full; the event that does not fit is dropped.
+    let failed = without_memory(|| {
+        (2..64).find_map(|i| match world.send_event(Ping(i)) {
+            Ok(()) => None,
+            Err(error) => Some((i, error)),
+        })
+    });
+    let first_refused = match failed {
+        Some((i, EcsError::OutOfMemory { .. })) => i,
+        other => panic!("unexpected {other:?}"),
+    };
+    let events = world.resource::<Events<Ping>>().unwrap();
+    let sent: Vec<u32> = events.iter().map(|ping| ping.0).collect();
+    assert_eq!(sent, (1..first_refused).collect::<Vec<_>>());
 }
 
 #[test]
