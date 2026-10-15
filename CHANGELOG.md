@@ -4,8 +4,10 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ## [Unreleased]
 
-The first crates.io release will be **1.0.0** (M6, DECISIONS #39): it contains everything below
-since 0.1.0. Tagging and publishing are done by the owner.
+## [1.0.0] - 2026-10-15
+
+The first crates.io release (M6, DECISIONS #39): everything since 0.1.0, milestones M2–M6
+(0.2.0–0.5.0 were never released separately).
 
 ### Added
 
