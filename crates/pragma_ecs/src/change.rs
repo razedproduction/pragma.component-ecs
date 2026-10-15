@@ -164,7 +164,7 @@ pub struct MutIter<'w, T> {
 impl<'w, T> Iterator for MutIter<'w, T> {
     type Item = Mut<'w, T>;
 
-    #[inline]
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         let (value, changed) = self.rows.next()?;
         Some(Mut {

@@ -1,6 +1,6 @@
-//! Command benchmarks (DECISIONS #23, #24): spawning 10 000 entities with two components and
-//! despawning them through `Commands` at the sync point, against the same operations applied
-//! directly to the world (the reference).
+//! Command benchmarks (DECISIONS #23, #24): spawning 10 000 entities with two components (one
+//! `insert` per component, or one bundle, DECISIONS #35) and despawning them through `Commands`
+//! at the sync point, against the same operations applied directly to the world (the reference).
 //!
 //! `cargo bench -p pragma_ecs --bench commands` (report: `target/criterion/report/index.html`).
 #![allow(
@@ -29,6 +29,13 @@ fn spawn_all(mut commands: Commands<'_>) -> Result<(), EcsError> {
             .spawn()?
             .insert(Position([i as f32; 3]))?
             .insert(Velocity([1.0, 2.0, 3.0]))?;
+    }
+    Ok(())
+}
+
+fn spawn_all_bundles(mut commands: Commands<'_>) -> Result<(), EcsError> {
+    for i in 0..N {
+        commands.spawn_bundle((Position([i as f32; 3]), Velocity([1.0, 2.0, 3.0])))?;
     }
     Ok(())
 }
@@ -82,6 +89,33 @@ fn bench_commands(c: &mut Criterion) {
             World::new,
             |mut world| {
                 spawner.run(&mut world, &pool).unwrap();
+                world
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    // Bundles (DECISIONS #35): straight into the final table, directly and through commands.
+    g.bench_function(BenchmarkId::new("spawn_bundle_direct", N), |b| {
+        b.iter_batched(
+            World::new,
+            |mut world| {
+                for i in 0..N {
+                    world
+                        .spawn_bundle((Position([i as f32; 3]), Velocity([1.0, 2.0, 3.0])))
+                        .unwrap();
+                }
+                world
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    let mut bundle_spawner = schedule(spawn_all_bundles);
+    g.bench_function(BenchmarkId::new("spawn_bundle_commands", N), |b| {
+        b.iter_batched(
+            World::new,
+            |mut world| {
+                bundle_spawner.run(&mut world, &pool).unwrap();
                 world
             },
             BatchSize::LargeInput,

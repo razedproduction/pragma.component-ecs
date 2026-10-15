@@ -2,6 +2,7 @@
 name = "pragma_ecs"
 description = "Entity Component System for pragma.core-based game engines and frameworks, in pure Rust"
 readme = "README.md"
+documentation = "https://docs.rs/pragma_ecs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +11,7 @@ authors.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-# Not published until the API is reviewed (docs/roadmap.md, M6).
-publish = false
+# Published from 1.0.0 (DECISIONS.md #39); its own README and LICENSE go into the package.
 
 [dependencies]
 pragma_core = { workspace = true, features = ["jobs", "graph"] }

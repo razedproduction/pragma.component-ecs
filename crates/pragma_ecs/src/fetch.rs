@@ -717,6 +717,7 @@ macro_rules! tuple_query {
         impl<$($name: Iterator),+> Iterator for TupleIter<($($name,)+)> {
             type Item = ($($name::Item,)+);
 
+            #[inline(always)]
             fn next(&mut self) -> Option<Self::Item> {
                 Some(($(self.0.$index.next()?,)+))
             }

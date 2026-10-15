@@ -1,7 +1,8 @@
 //! Change ticks against a per-entity oracle (DECISIONS #27, #28).
 //!
 //! Random world operations (spawning, inserting, replacing, removing, `get_mut`, writing through
-//! `Mut` in a query, moving rows between tables, despawning) interleave with calls of long-lived
+//! `Mut` in a query, moving rows between tables, spawning and inserting bundles, despawning)
+//! interleave with calls of long-lived
 //! queries with `Added` / `Changed` filters. The oracle keeps, per entity, the sequence numbers
 //! of the operations that added and last changed its component, and per query the sequence
 //! number of its previous call: every answer must match. Used by `tests/change.rs` and the
@@ -34,6 +35,11 @@ pub enum Op {
     Move(usize),
     /// Asks observer `.0` (`0..OBSERVERS`).
     Observe(usize),
+    /// Spawns an entity with the bundle `(A(v),)` (DECISIONS #35).
+    SpawnBundle(u32),
+    /// Inserts the bundle `(Mover, A(v))` if the flag is set, else `(A(v),)`: a replaced `A` is
+    /// changed, a new one added, in one move.
+    InsertBundle(usize, u32, bool),
 }
 
 pub const OBSERVERS: usize = 4;
@@ -46,7 +52,13 @@ pub fn decode(data: &[u8]) -> Vec<Op> {
     let mut bytes = Bytes::new(data);
     let mut ops = Vec::new();
     while !bytes.is_empty() && ops.len() < MAX_OPS {
-        let op = match bytes.below(18) {
+        let op = match bytes.below(21) {
+            18 => Op::SpawnBundle(bytes.u32()),
+            19 | 20 => {
+                let i = bytes.index();
+                let v = bytes.u32();
+                Op::InsertBundle(i, v, bytes.bool())
+            }
             0..=2 => Op::Spawn,
             3 => Op::Despawn(bytes.index()),
             4..=7 => {
@@ -94,6 +106,22 @@ struct Harness {
     writer: Query<&'static mut A>,
 }
 
+/// The record after `A(v)` is inserted at `seq`: a replacement is a change, a new one is added.
+fn put(record: &mut Option<Record>, v: u32, seq: u64) {
+    *record = Some(match *record {
+        Some(r) => Record {
+            value: v,
+            changed: seq,
+            ..r
+        },
+        None => Record {
+            value: v,
+            added: seq,
+            changed: seq,
+        },
+    });
+}
+
 fn sorted(mut v: Vec<Entity>) -> Vec<Entity> {
     v.sort();
     v
@@ -126,18 +154,40 @@ impl Harness {
                     Some(record) => {
                         let replaced = result.unwrap();
                         assert_eq!(replaced.map(|a| a.0), record.map(|r| r.value));
-                        *record = Some(match *record {
-                            Some(r) => Record {
-                                value: v,
-                                changed: seq,
-                                ..r
-                            },
-                            None => Record {
-                                value: v,
-                                added: seq,
-                                changed: seq,
-                            },
-                        });
+                        put(record, v, seq);
+                    }
+                    None => assert!(matches!(result, Err(EcsError::NoSuchEntity { .. }))),
+                }
+            }
+            Op::SpawnBundle(v) => {
+                let e = self.world.spawn_bundle((A(v),)).unwrap();
+                self.known.push(e);
+                self.alive.insert(
+                    e,
+                    Some(Record {
+                        value: v,
+                        added: seq,
+                        changed: seq,
+                    }),
+                );
+                self.movers.insert(e, false);
+            }
+            Op::InsertBundle(i, v, mover) => {
+                let Some(e) = pick(&self.known, i) else {
+                    return;
+                };
+                let result = if mover {
+                    self.world.insert_bundle(e, (Mover, A(v)))
+                } else {
+                    self.world.insert_bundle(e, (A(v),))
+                };
+                match self.alive.get_mut(&e) {
+                    Some(record) => {
+                        result.unwrap();
+                        put(record, v, seq);
+                        if mover {
+                            self.movers.insert(e, true);
+                        }
                     }
                     None => assert!(matches!(result, Err(EcsError::NoSuchEntity { .. }))),
                 }

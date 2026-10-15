@@ -158,8 +158,8 @@ jobs:
         with:
           tool: cargo-semver-checks
       # The baseline is main, not a tag (DECISIONS #33): a breaking public API change without a
-      # version bump fails the PR. The package is named because `publish = false` crates are
-      # skipped by `--workspace`. A short target directory: semver-checks nests the baseline's
+      # version bump fails the PR. The package is named: `--workspace` would also pick the
+      # unpublished example, and skipped `pragma_ecs` itself while it was `publish = false` (before 1.0). A short target directory: semver-checks nests the baseline's
       # build several levels deep (`target/semver-checks/git-<sha>/local-…/target/debug/build/…`),
       # which exceeds MAX_PATH on Windows (LNK1104).
       - run: cargo semver-checks -p pragma_ecs --baseline-rev ${{ github.event.pull_request.base.sha }}

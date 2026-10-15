@@ -273,7 +273,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "ecs_sim"
-version = "0.5.0"
+version = "1.0.0"
 dependencies = [
  "pragma_core",
  "pragma_ecs",
@@ -573,7 +573,7 @@ dependencies = [
 
 [[package]]
 name = "pragma_ecs"
-version = "0.5.0"
+version = "1.0.0"
 dependencies = [
  "criterion",
  "pragma_core",

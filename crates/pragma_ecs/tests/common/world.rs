@@ -5,6 +5,7 @@
 //! parallel, change exactly those entities. Used by `tests/oracle.rs` and the `world_ops` fuzz
 //! target.
 
+use std::any::type_name;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -61,6 +62,83 @@ pub enum Op {
     QueryAdd(i32),
     /// Adds the value to `Pos` of every entity without a `Tag`, in parallel, chunks of the size.
     ParAdd(i32, usize),
+    /// Spawns an entity with the bundle of shape `SHAPES[shape % SHAPES.len()]` (DECISIONS #35).
+    SpawnBundle(usize, i32),
+    /// Inserts the bundle of the shape into an entity.
+    InsertBundle(usize, usize, i32),
+}
+
+/// The bundles the operations use: their component kinds, in tuple order. The last shape holds
+/// `Pos` twice and is rejected with `EcsError::DuplicateComponent`.
+pub const SHAPES: [&[Kind]; 7] = [
+    &[Kind::Pos, Kind::Name],
+    &[Kind::Name, Kind::Tag, Kind::Pos],
+    &[Kind::Tracked, Kind::Pos],
+    &[Kind::Tag],
+    &[],
+    &[Kind::Pos, Kind::Name, Kind::Tag, Kind::Tracked],
+    &[Kind::Pos, Kind::Tag, Kind::Pos],
+];
+
+/// The shape with a duplicate type.
+const DUPLICATE: usize = 6;
+
+/// The bundle of `shape` with the value `v`, passed to `$apply`.
+macro_rules! with_bundle {
+    ($shape:expr, $v:expr, $token:expr, |$bundle:ident| $apply:expr) => {{
+        let (v, token): (i32, &Arc<()>) = ($v, $token);
+        let (pos, name, tracked) = (Pos(v), Name(v.to_string()), Tracked(Arc::clone(token)));
+        match $shape {
+            0 => {
+                let $bundle = (pos, name);
+                $apply
+            }
+            1 => {
+                let $bundle = (name, Tag, pos);
+                $apply
+            }
+            2 => {
+                let $bundle = (tracked, pos);
+                $apply
+            }
+            3 => {
+                let $bundle = (Tag,);
+                $apply
+            }
+            4 => {
+                let $bundle = ();
+                $apply
+            }
+            5 => {
+                let $bundle = (pos, name, Tag, tracked);
+                $apply
+            }
+            _ => {
+                let $bundle = (pos, Tag, Pos(v));
+                $apply
+            }
+        }
+    }};
+}
+
+/// Applies a bundle of `shape` with the value `v` to an oracle row.
+fn put_bundle(row: &mut Row, shape: usize, v: i32) {
+    for kind in SHAPES[shape] {
+        match kind {
+            Kind::Pos => row.pos = Some(Pos(v)),
+            Kind::Name => row.name = Some(Name(v.to_string())),
+            Kind::Tag => row.tag = Some(Tag),
+            Kind::Tracked => row.tracked = true,
+        }
+    }
+}
+
+/// `Err(component)` of a `DuplicateComponent`; any other error fails the test.
+fn duplicate(err: EcsError) -> &'static str {
+    match err {
+        EcsError::DuplicateComponent { component, .. } => component,
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 /// The most operations decoded from one input.
@@ -72,7 +150,7 @@ pub fn decode(data: &[u8]) -> Vec<Op> {
     let mut ops = Vec::new();
     while !bytes.is_empty() && ops.len() < MAX_OPS {
         let kind = |b: &mut Bytes<'_>| Kind::ALL[usize::from(b.below(4))];
-        let op = match bytes.below(14) {
+        let op = match bytes.below(16) {
             0..=2 => Op::Spawn,
             3 => Op::Despawn(bytes.index()),
             4..=8 => {
@@ -89,9 +167,18 @@ pub fn decode(data: &[u8]) -> Vec<Op> {
                 Op::Mutate(i, bytes.i32())
             }
             12 => Op::QueryAdd(bytes.i32()),
-            _ => {
+            13 => {
                 let v = bytes.i32();
                 Op::ParAdd(v, 1 + usize::from(bytes.below(7)))
+            }
+            14 => {
+                let shape = usize::from(bytes.below(7));
+                Op::SpawnBundle(shape, bytes.i32())
+            }
+            _ => {
+                let i = bytes.index();
+                let shape = usize::from(bytes.below(7));
+                Op::InsertBundle(i, shape, bytes.i32())
             }
         };
         ops.push(op);
@@ -288,6 +375,44 @@ impl Harness {
                 }
                 // Every matching entity exactly once.
                 assert_eq!(sorted(visited.into_inner().unwrap()), sorted(expected));
+            }
+            Op::SpawnBundle(shape, v) => {
+                let shape = shape % SHAPES.len();
+                let token = Arc::clone(&self.token);
+                let world = &mut self.world;
+                let spawned = with_bundle!(shape, v, &token, |bundle| world.spawn_bundle(bundle));
+                if shape == DUPLICATE {
+                    assert_eq!(spawned.map_err(duplicate), Err(type_name::<Pos>()));
+                    return;
+                }
+                let e = spawned.unwrap();
+                assert!(!self.oracle.contains_key(&e), "{e} reused while alive");
+                assert!(!self.known.contains(&e), "{e} issued twice");
+                let mut row = Row::default();
+                put_bundle(&mut row, shape, v);
+                self.oracle.insert(e, row);
+                self.known.push(e);
+            }
+            Op::InsertBundle(i, shape, v) => {
+                let Some(e) = pick(&self.known, i) else {
+                    return;
+                };
+                let shape = shape % SHAPES.len();
+                let token = Arc::clone(&self.token);
+                let world = &mut self.world;
+                let actual =
+                    with_bundle!(shape, v, &token, |bundle| world.insert_bundle(e, bundle));
+                match (self.oracle.get_mut(&e), actual) {
+                    // A stale entity is reported before the bundle is looked at.
+                    (None, actual) => assert_eq!(actual.map_err(stale), Err(e)),
+                    (Some(_), Err(err)) if shape == DUPLICATE => {
+                        assert_eq!(duplicate(err), type_name::<Pos>());
+                    }
+                    (Some(row), actual) => {
+                        actual.unwrap();
+                        put_bundle(row, shape, v);
+                    }
+                }
             }
         }
     }

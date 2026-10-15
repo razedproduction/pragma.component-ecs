@@ -332,15 +332,16 @@ fn respawn(
             2 => Position { x: 0.0, y: along },
             _ => Position { x: ARENA, y: along },
         };
-        commands
-            .spawn()?
-            .insert(position)?
-            .insert(Velocity {
+        // A bundle: the newborn goes straight into its final table (DECISIONS #35).
+        commands.spawn_bundle((
+            position,
+            Velocity {
                 x: (rng.unit() - 0.5) * 100.0,
                 y: (rng.unit() - 0.5) * 100.0,
-            })?
-            .insert(Health(MAX_HEALTH))?
-            .insert(Age(0))?;
+            },
+            Health(MAX_HEALTH),
+            Age(0),
+        ))?;
         total.0 = total.0.wrapping_add(1);
     }
     Ok(())
@@ -439,23 +440,20 @@ pub fn populate(config: &SimConfig) -> Result<World, EcsError> {
     let mut rng = Rng(config.seed);
     let mut world = World::new();
     for i in 0..config.entities {
-        let entity = world.spawn()?;
-        world.insert(
-            entity,
+        // The tuple's fields are evaluated left to right: the same random sequence as before
+        // bundles, so the golden hashes did not change (DECISIONS #35).
+        let entity = world.spawn_bundle((
             Position {
                 x: rng.unit() * ARENA,
                 y: rng.unit() * ARENA,
             },
-        )?;
-        world.insert(
-            entity,
             Velocity {
                 x: (rng.unit() - 0.5) * 100.0,
                 y: (rng.unit() - 0.5) * 100.0,
             },
-        )?;
-        world.insert(entity, Health(MAX_HEALTH * (0.2 + 0.8 * rng.unit())))?;
-        world.insert(entity, Age(0))?;
+            Health(MAX_HEALTH * (0.2 + 0.8 * rng.unit())),
+            Age(0),
+        ))?;
         // A new entity has no marker yet: nothing is replaced.
         let _ = match i.checked_rem(config.fragments) {
             Some(1) => world.insert(entity, Shard1)?.map(|_| ()),

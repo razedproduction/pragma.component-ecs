@@ -505,18 +505,19 @@ impl<I: Iterator> Iterator for Masked<'_, I> {
         }
     }
 
-    #[inline]
+    /// The whole per-row path of the iterators (this, the element iterators, the table switch)
+    /// is inlined into the caller's loop, and the table-filter case is decided once per call
+    /// rather than per row (DECISIONS #37).
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let item = self.items.next()?;
-            match &mut self.mask {
-                None => return Some(item),
-                Some(mask) => {
-                    if mask.next().copied().unwrap_or(false) {
-                        return Some(item);
-                    }
+        match &mut self.mask {
+            None => self.items.next(),
+            Some(mask) => loop {
+                let item = self.items.next()?;
+                if mask.next().copied().unwrap_or(false) {
+                    return Some(item);
                 }
-            }
+            },
         }
     }
 }
@@ -655,6 +656,7 @@ impl<Q: QueryData, F: QueryFilter> fmt::Debug for QueryIter<'_, '_, Q, F> {
 
 impl<'w, 's, Q: QueryData, F: QueryFilter> QueryIter<'w, 's, Q, F> {
     /// The rows of the next matching table; `None` when every table was visited.
+    #[inline(always)]
     fn table(&mut self) -> Option<Option<Masked<'s, Q::Iter<'w>>>> {
         let &id = self.ids.next()?;
         let table = self.tables.get(id)?;
@@ -666,6 +668,7 @@ impl<'w, 's, Q: QueryData, F: QueryFilter> QueryIter<'w, 's, Q, F> {
 impl<'w, Q: QueryData, F: QueryFilter> Iterator for QueryIter<'w, '_, Q, F> {
     type Item = Q::Item<'w>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(item) = self.rows.as_mut().and_then(Iterator::next) {
@@ -725,6 +728,7 @@ impl<Q: QueryData, F: QueryFilter> fmt::Debug for QueryIterMut<'_, '_, Q, F> {
 
 impl<'w, 's, Q: QueryData, F: QueryFilter> QueryIterMut<'w, 's, Q, F> {
     /// The rows of the next matching table; `None` when every table was visited.
+    #[inline(always)]
     fn table(&mut self) -> Option<Option<Masked<'s, Q::Iter<'w>>>> {
         let table = self.tables.next()?;
         let mask = self.masks.take(table.len());
@@ -735,6 +739,7 @@ impl<'w, 's, Q: QueryData, F: QueryFilter> QueryIterMut<'w, 's, Q, F> {
 impl<'w, Q: QueryData, F: QueryFilter> Iterator for QueryIterMut<'w, '_, Q, F> {
     type Item = Q::Item<'w>;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(item) = self.rows.as_mut().and_then(Iterator::next) {

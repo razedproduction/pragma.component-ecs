@@ -194,7 +194,31 @@ impl ScheduleBuilder {
 
     /// Adds `system` under the name `name`, without an explicit order.
     ///
-    /// The system's access is the union of its parameters' accesses (DECISIONS #17).
+    /// The system's access is the union of its parameters' accesses (DECISIONS #17). A system
+    /// is a function or a closure (one that captures its own configuration, for example).
+    ///
+    /// ```
+    /// use pragma_ecs::{EcsError, ResMut, Schedule, View};
+    ///
+    /// struct Health(u32);
+    /// struct Alive(usize);
+    ///
+    /// fn count(mut healths: View<&Health>, mut alive: ResMut<Alive>) -> Result<(), EcsError> {
+    ///     alive.0 = healths.iter()?.filter(|h| h.0 > 0).count();
+    ///     Ok(())
+    /// }
+    ///
+    /// let regen = 2;
+    /// let mut builder = Schedule::builder();
+    /// builder.add_system("count", count)?;
+    /// builder.add_system("regenerate", move |mut healths: View<&mut Health>| -> Result<(), EcsError> {
+    ///     healths.iter_mut()?.for_each(|mut h| h.0 += regen);
+    ///     Ok(())
+    /// })?;
+    /// // `regenerate` writes what `count` reads, without an order: rejected at build time.
+    /// assert!(matches!(builder.build(), Err(EcsError::AmbiguousOrder { .. })));
+    /// # Ok::<(), EcsError>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -270,6 +294,19 @@ impl ScheduleBuilder {
 
     /// Validates the systems and builds the schedule. Build once at startup, or when the set
     /// of systems changes, not every frame.
+    ///
+    /// ```
+    /// use pragma_ecs::{EcsError, Schedule};
+    ///
+    /// fn a() {}
+    /// fn b() {}
+    ///
+    /// let mut builder = Schedule::builder();
+    /// builder.add_system_with("a", a, |c| c.after("b"))?;
+    /// builder.add_system_with("b", b, |c| c.after("a"))?;
+    /// assert!(matches!(builder.build(), Err(EcsError::Schedule { .. }))); // a cycle
+    /// # Ok::<(), EcsError>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -441,7 +478,9 @@ impl Schedule {
     /// returned afterwards, also after a failed frame (DECISIONS #18). At the sync point the
     /// event types the systems use are updated, then the commands and events every system
     /// deferred are applied, system after system in registration order (DECISIONS #24). Call it
-    /// from a thread outside the pool (the main loop): that thread runs systems too.
+    /// from a thread outside the pool (the main loop): that thread runs systems too. See the
+    /// [`Schedule`] example and, for a whole frame loop, "Integrating into an engine" in the
+    /// crate docs.
     ///
     /// # Errors
     ///

@@ -14,7 +14,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 | M3 | 0.3.0 | Systems on the pragma.core frame graph, vertical slice | 🚧 |
 | M4 | 0.4.0 | Commands, events, change detection | 🚧 |
 | M5 | 0.5.0 | Hardening: determinism, fuzz, benches, semver | 🚧 |
-| M6 | 1.0.0 | Stable API, publication | 📋 |
+| M6 | 1.0.0 | Stable API, publication | 🚧 |
 
 ---
 
@@ -97,12 +97,21 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
   (`tools/bench_gate.py`, PRs on Windows and Linux)
 - [x] `cargo-semver-checks` in CI (PRs, baseline `main`)
 
-## M6 — 1.0 (1.0.0)
+## M6 — 1.0 (1.0.0) 🚧
 
-- [ ] API review, rustdoc with examples, an "Integrating into an engine" section
-- [ ] Bundle spawns into the final table, for `World` and `Commands` (DECISIONS #34: spawning
-  is the largest gap to `hecs` / `bevy_ecs` in the M5 baseline)
-- [ ] Publication on crates.io
+- [x] **Decisions:** an additive sealed `Bundle` for tuples (DECISIONS #35), the API review —
+  no renames, hidden items outside semver, `pub use pragma_core` (#36), the sequential query
+  loop (#37), embedding documentation in the crate docs (#38), 1.0.0 directly with only
+  `pragma_ecs` published (#39)
+- [x] API review, rustdoc with examples, an "Integrating into an engine" section (crate docs,
+  with a compiled engine skeleton); `cargo semver-checks` confirms 1.0.0 only adds to 0.5.0
+- [x] Bundle spawns into the final table, for `World` and `Commands` (`spawn_bundle`,
+  `insert_bundle`; DECISIONS #34: spawning was the largest gap to `hecs` / `bevy_ecs` in the
+  M5 baseline — 2.46 ms → about 1.0 ms, level with `bevy_ecs`, `docs/architecture.md` §6), tested against the
+  oracles, fuzzed, benchmarked; `ecs_sim` spawns through bundles with unchanged golden hashes
+- [x] crates.io metadata: version 1.0.0, `publish` enabled, the crate's own README and LICENSE,
+  `cargo package -p pragma_ecs` verified
+- [ ] Publication on crates.io and the tag (by the owner)
 
 ---
 

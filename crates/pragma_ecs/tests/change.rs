@@ -1,7 +1,7 @@
 //! Change detection (DECISIONS #27, #28).
 //!
 //! The property test applies random world operations (spawning, inserting, replacing, removing,
-//! `get_mut`, writing through `Mut` in a query, moving rows between tables, despawning) and
+//! `get_mut`, writing through `Mut` in a query, moving rows between tables, bundles, despawning) and
 //! asks long-lived queries with `Added` / `Changed` filters at random points. A naive oracle
 //! keeps, per entity, the sequence numbers of the operations that added and last changed its
 //! component, and per query the sequence number of its previous call: every answer must match.
@@ -33,6 +33,9 @@ fn op() -> impl Strategy<Value = Op> {
         1 => Just(Op::WriteOdd),
         2 => any::<usize>().prop_map(Op::Move),
         4 => (0..OBSERVERS).prop_map(Op::Observe),
+        1 => any::<u32>().prop_map(Op::SpawnBundle),
+        2 => (any::<usize>(), any::<u32>(), any::<bool>())
+            .prop_map(|(i, v, m)| Op::InsertBundle(i, v, m)),
     ]
 }
 

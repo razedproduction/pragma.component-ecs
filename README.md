@@ -13,8 +13,11 @@ caught when the schedule is built, not as a data race at run time.
 
 ## Status
 
-**M5 — hardening** (on top of M4: commands, events, change detection). A `World` of generational `Entity` ids,
-components in archetype tables and resources; typed queries with declared access, sequential or
+**M6 — 1.0** (stable API; publication on crates.io pending): version 1.0.0, the API reviewed,
+every public item documented with examples, and an "Integrating into an engine" section in the
+[crate docs](crates/pragma_ecs/src/lib.rs). A `World` of generational `Entity` ids,
+components in archetype tables (bundles spawn straight into their final table) and resources;
+typed queries with declared access, sequential or
 parallel on the pragma.core thread pool; and systems — plain functions of `View`, `Res`,
 `ResMut`, `Commands`, `EventWriter` and `EventReader` parameters — run by a `Schedule` as tasks
 of the pragma.core frame graph. Systems with disjoint access run in parallel; conflicting
@@ -28,8 +31,14 @@ commands and change ticks are fuzzed against naive oracles, a bench gate guards 
 and baseline benchmarks compare the crate with `hecs` and `bevy_ecs`. See the
 [roadmap](docs/roadmap.md) and the [architecture](docs/architecture.md).
 
+```toml
+[dependencies]
+pragma_ecs = "1.0"
+```
+
 ```rust
-use pragma_core::prelude::{Grain, PoolConfig, ThreadPool};
+// The pragma_core the ECS is built with is re-exported.
+use pragma_ecs::pragma_core::prelude::{Grain, PoolConfig, ThreadPool};
 use pragma_ecs::{Changed, Commands, EcsError, Entity, Res, ResMut, Schedule, View, Without, World};
 
 struct Position(f32, f32);
@@ -73,9 +82,8 @@ fn bounds(
 }
 
 let mut world = World::new();
-let entity = world.spawn()?;
-world.insert(entity, Position(0.0, 0.0))?;
-world.insert(entity, Velocity(1.0, 0.5))?;
+// A bundle: the entity goes straight into the table of {Position, Velocity}.
+world.spawn_bundle((Position(0.0, 0.0), Velocity(1.0, 0.5)))?;
 world.insert_resource(Dt(1.0 / 60.0));
 world.insert_resource(Energy(0.0));
 
@@ -142,8 +150,18 @@ The same rules as pragma.core, checked in CI on every PR:
 
 Windows and Linux (x86_64), tested in CI.
 
+## Versioning
+
+[SemVer](https://semver.org/) from 1.0.0, checked by `cargo semver-checks` on every PR. Items
+hidden from the documentation (`#[doc(hidden)]`, the machinery of the sealed traits) are not
+covered (DECISIONS #36). `pragma_core` types are part of the API, so a `pragma_core` 2.0 means a
+`pragma_ecs` 2.0. The MSRV (1.88) follows pragma.core's policy: raised only in a minor release,
+with a CHANGELOG line.
+
 ## Documentation
 
+- API documentation with examples and "Integrating into an engine":
+  [docs.rs/pragma_ecs](https://docs.rs/pragma_ecs) (after the release), or `cargo doc -p pragma_ecs --open`
 - [Architecture](docs/architecture.md)
 - [Roadmap](docs/roadmap.md)
 - [Decision log](DECISIONS.md)

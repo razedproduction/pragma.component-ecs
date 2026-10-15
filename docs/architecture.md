@@ -1,9 +1,9 @@
 # Architecture
 
-Status: §2–3 are **implemented** (M1), queries in §4 too (M2), systems, resources and
-schedules (M3), and commands, events and change detection (§4, M4), and the hardening tools of M5
-(§6); the rest is the **intended design**. Sections marked *open* are decided in the
-milestone named there and recorded in `DECISIONS.md`.
+Status: everything here is **implemented** as of 1.0.0 (M6): entities and storage (§2–3, M1,
+bundles M6), queries, systems, resources and schedules (§4, M2–M3), commands, events and change
+detection (§4, M4) and the hardening tools (§6, M5). The reasons are in `DECISIONS.md`; how an
+engine wires the pieces together is "Integrating into an engine" in the crate docs.
 
 ## 1. Place in the stack
 
@@ -38,7 +38,9 @@ World
 │                                  plus a Vec<ComponentTicks> (added, changed: u64, M4)
 │     entities: [Entity]          row → entity, parallel to every column
 │     add/remove edges            TypeId → neighbouring archetype (cache)
+│     bundle edges                bundle TypeId → archetype with the bundle's types (M6)
 └── by_types: HashMap<[TypeId], archetype id>
+    (every map keyed by TypeIds uses a multiplicative hasher, not SipHash: DECISIONS #35)
 ```
 
 - **Tables.** Entities with the same component set share an archetype. A component lives at
@@ -58,8 +60,18 @@ World
   #9); the trait has the operations a table needs without knowing `T` (an empty clone, reserve,
   `swap_remove` with drop, `swap_remove` into another column of the same type). Iteration (M2)
   downcasts each column once per table and then works on plain slices.
+- **Bundles (M6, DECISIONS #35).** A `Bundle` is a tuple of 0–12 components. `spawn_bundle`
+  looks up the target table through the empty table's bundle edge (on a miss: the bundle's
+  types are sorted, checked for duplicates — `EcsError::DuplicateComponent` — and merged with
+  the source table's, the table is found in `by_types` or created), reserves one row, allocates
+  the id and writes each component into its column; `insert_bundle` does the same from the
+  entity's table, moving the row once and replacing the components it already had in place.
+  Deferred bundles (`Commands::spawn_bundle` / `insert_bundle`) wait in a typed lane of their
+  own and apply the same operations at the sync point. Ids and row order are the same as with
+  `spawn` + `insert`s, and so is the relative order of the final tables.
 - **Components.** `Component` is implemented for every `Send + Sync + 'static` type; zero-sized
-  components cost no memory (`Vec<ZST>`).
+  components cost no memory (`Vec<ZST>`). A tuple is a component too, which is why bundles have
+  their own methods instead of `insert` taking a bundle.
 
 Not chosen for now: sparse sets (cheap add/remove, but multi-component iteration needs a join) and
 a hybrid (sparse sets opt-in per type). A hybrid can be added later without changing the `World`
@@ -256,8 +268,9 @@ costs ≈ 140 µs when nothing changed, ≈ 161 µs when 10 % did and ≈ 217 µ
 ≈ 122 µs without the filter. Spawning 10 000 entities with two components through commands
 ≈ 3.1 ms against ≈ 2.5 ms directly (each command is an ordinary world operation, so a spawn
 moves the entity through `{}` → `{A}` → `{A, B}`); despawning ≈ 377 µs against ≈ 277 µs.
-Batching spawns into their final table: after the M5 baseline (§6), an M6 API item (DECISIONS
-#34).
+With bundles (M6, DECISIONS #35) the same spawn is ≈ 0.94 ms directly and ≈ 1.31 ms through
+commands (`commands/spawn_bundle_*`; `spawn` + two `insert`s ≈ 2.07 ms / 2.76 ms on the same
+run).
 
 ## 5. Reliability rules
 
@@ -300,25 +313,31 @@ tools/bench_gate.py               A/B of PR base and head, normalized by a refer
   (`query_iter/query_8_tables`) depends on code generation, not on our code — changing only
   the crate version from 0.1.0 to 0.5.0 (which changes symbol hashes) moved it from ≈ 345 µs to
   ≈ 480–550 µs on the same machine, reproducibly, while the 1-table, read-only and parallel
-  variants stayed put; `#[inline]` on the iterators' `next` did not help. The gate reports it
-  as a regression on the PR that bumps the version; making that loop robust (internal
-  iteration per table) is a follow-up.
+  variants stayed put. M6 (DECISIONS #37) inlined the whole per-row path and decides the
+  table-filter case once per call: one table went from ≈ 307 µs to ≈ 281 µs, but eight tables
+  still range from ≈ 382 µs (version 0.5.0) to ≈ 479–512 µs (1.0.0) for the same source, never
+  slower than `main`. Moving the table switch out of line made both 2–3× slower and aligning
+  loops did not help; a different iterator shape (no `Option` around the current table, an
+  index-based tuple iterator) is a 1.x follow-up. The gate keeps measuring it.
 - **Semver.** `cargo semver-checks -p pragma_ecs` against the PR base: a breaking change needs a
   version bump (the version is 0.5.0 since M5).
 
 Baseline numbers (`cargo bench --manifest-path baseline/Cargo.toml --bench baseline`, 8 logical
-cores, Windows, release, medians):
+cores, Windows, release, medians; M5 = 0.5.0, the rest measured on 1.0.0 in one run):
 
-| workload | pragma_ecs | hecs 0.11 | bevy_ecs 0.20 |
-|---|---|---|---|
-| spawn 10 000 entities with 2 components | 2.46 ms | 0.59 ms | 1.07 ms |
-| iterate 100 000 `(&mut Position, &Velocity)` (a `Vec`: 258 µs) | 322 µs | 204 µs | 348 µs |
-| iterate 20 rows in each of 26 tables | 1.62 µs | 0.35 µs | 1.04 µs |
-| add and remove a component on 10 000 entities | 3.06 ms | 1.85 ms | 2.59 ms |
-| despawn 10 000 entities | 277 µs | 344 µs | 874 µs |
+| workload | pragma_ecs M5 | pragma_ecs 1.0 | hecs 0.11 | bevy_ecs 0.20 |
+|---|---|---|---|---|
+| spawn 10 000 entities with 2 components | 2.46 ms | 1.00 ms (bundle); 1.85 ms (`spawn` + `insert`s) | 0.55 ms | 0.96 ms |
+| iterate 100 000 `(&mut Position, &Velocity)` (a `Vec`: ≈ 252 µs) | 322 µs | 280 µs | 198 µs | 277 µs |
+| iterate 20 rows in each of 26 tables | 1.62 µs | 1.51 µs | 0.36 µs | 1.07 µs |
+| add and remove a component on 10 000 entities | 3.06 ms | 2.61 ms | 1.96 ms | 2.74 ms |
+| despawn 10 000 entities | 277 µs | 271 µs | 320 µs | 869 µs |
 
 `pragma_ecs` and `bevy_ecs` stamp a change tick on every write (`u64` and `u32`), `hecs` has
-no change detection; iteration is faster than `bevy_ecs` and pays the tick store against
-`hecs`. Spawning is the gap: without bundles every `insert` moves the entity to the next table
-(`{}` → `{Position}` → `{Position, Velocity}`). DECISIONS #34 keeps the storage and the ticks as
-they are and leaves bundle spawns (for the world and for commands) to the M6 API review.
+no change detection; iteration is on par with `bevy_ecs` and pays the tick store against
+`hecs`. Spawning was the gap in M5: without bundles every `insert` moves the entity to the next
+table (`{}` → `{Position}` → `{Position, Velocity}`). DECISIONS #34 kept the storage and the
+ticks as they are; M6 added bundles, which write an entity straight into its final table, and a
+cheaper hasher for the maps keyed by type ids (#35), which brings spawning level with
+`bevy_ecs`. What remains against `hecs` is per-row bookkeeping: the generational id slot, three
+vectors per column (values and the two `u64` tick vectors, #27) and their growth.

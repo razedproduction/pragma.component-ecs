@@ -70,6 +70,29 @@ pub enum EcsError {
         component: &'static str,
     },
 
+    /// A [`Bundle`](crate::Bundle) holds the same component type twice, e.g. `(A, A)`: an
+    /// entity has at most one component of each type (DECISIONS #35). Nothing was changed.
+    ///
+    /// ```
+    /// use pragma_ecs::{EcsError, World};
+    ///
+    /// struct Speed(f32);
+    ///
+    /// let mut world = World::new();
+    /// let err = world.spawn_bundle((Speed(1.0), Speed(2.0))).err();
+    /// assert!(matches!(
+    ///     err,
+    ///     Some(EcsError::DuplicateComponent { component, .. }) if component.ends_with("Speed")
+    /// ));
+    /// assert!(world.is_empty());
+    /// ```
+    #[error("a bundle holds the component type `{component}` more than once")]
+    #[non_exhaustive]
+    DuplicateComponent {
+        /// The type name of the component (`std::any::type_name`).
+        component: &'static str,
+    },
+
     /// A system uses a resource type twice and at least one use writes it, e.g.
     /// `(Res<Score>, ResMut<Score>)`: the two borrows would alias (DECISIONS #17).
     ///
