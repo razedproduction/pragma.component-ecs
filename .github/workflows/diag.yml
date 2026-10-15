@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -18,30 +18,21 @@ jobs:
           fetch-depth: 0
       - run: rustup show
       - name: environment
-        run: |
-          lscpu | grep -E 'Model name|^CPU\(s\)|L1d|L2|L3' || true
-          ldd --version | head -1
+        run: lscpu | grep -E 'Model name' || true
       - name: build
         run: |
-          git worktree add --detach ../main origin/main
-          git worktree add --detach ../base origin/tmp/lx-base
-          (cd ../main && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../tm cargo bench -p pragma_ecs --bench change --bench query --no-run)
-          (cd ../base && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../tb cargo bench -p pragma_ecs --bench change --bench query --no-run)
-          CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../th cargo bench -p pragma_ecs --bench change --bench query --no-run
+          for side in main:origin/main c209b4d:origin/tmp/lx-base0 da269fd:origin/patch-query-iter; do
+            name=${side%%:*}; rev=${side#*:}
+            git worktree add --detach ../$name $rev
+            (cd ../$name && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t-$name cargo bench -p pragma_ecs --bench change --no-run)
+            (cd ../$name && RUSTFLAGS="-C llvm-args=-align-loops=64" CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../a-$name cargo bench -p pragma_ecs --bench change --no-run)
+          done
       - name: interleaved runs
         run: |
-          exe() { ls "$1"/release/deps/$2-* | grep -v '\.d$' | head -1; }
-          run() { # label target-dir offset
-            if [ "$3" = "-" ]; then unset PRAGMA_XL_OFF; else export PRAGMA_XL_OFF=$3; fi
-            "$(exe $2 change)" --bench --warm-up-time 1 --measurement-time 3 --noplot 'change/mut' 2>/dev/null \
-              | grep -E 'time:   \[[0-9]' | awk -v l="$1" '{print "RES", l, NR==1?"mut_read_only":"mut_write_all", $4}'
-            "$(exe $2 query)" --bench --warm-up-time 1 --measurement-time 3 --noplot 'query_iter/(vec|query_8_tables)/' 2>/dev/null \
-              | grep -E 'time:   \[[0-9]' | awk -v l="$1" '{print "RES", l, NR==1?"vec":"query_8_tables", $4}'
-            unset PRAGMA_XL_OFF
-          }
+          exe() { ls "$1"/release/deps/change-* | grep -v '\.d$' | head -1; }
           for r in 1 2 3; do
-            run "main" ../tm -
-            run "c209b4d" ../tb -
-            run "head" ../th -
-            run "head-plain" ../th plain
+            for d in t-main t-c209b4d t-da269fd a-main a-c209b4d a-da269fd; do
+              "$(exe ../$d)" --bench --warm-up-time 1 --measurement-time 3 --noplot 'change/mut' 2>/dev/null \
+                | grep -E 'time:   \[[0-9]' | awk -v l="$d" '{print "RES", l, NR==1?"mut_read_only":"mut_write_all", $4}'
+            done
           done
