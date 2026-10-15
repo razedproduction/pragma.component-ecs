@@ -13,7 +13,7 @@ caught when the schedule is built, not as a data race at run time.
 
 ## Status
 
-**1.0.1 — stable**, [on crates.io](https://crates.io/crates/pragma_ecs): version 1.0.1, the API reviewed,
+**1.0.2 — stable**, [on crates.io](https://crates.io/crates/pragma_ecs): version 1.0.2, the API reviewed,
 every public item documented with examples, and an "Integrating into an engine" section in the
 [crate docs](crates/pragma_ecs/src/lib.rs). A `World` of generational `Entity` ids,
 components in archetype tables (bundles spawn straight into their final table) and resources;

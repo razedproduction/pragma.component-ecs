@@ -4,16 +4,12 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ## [Unreleased]
 
-## [1.0.1] - 2026-10-15
+## [1.0.2] - 2026-10-16
 
-A patch release: no change to the public API (DECISIONS #40–#43).
+A patch release: no change to the public API (DECISIONS #41–#43).
 
 ### Fixed
 
-- `World::send_event` for the first event of a type no longer aborts the process when memory
-  runs out: the event's buffer is reserved before the `Events<T>` resource is created, so the
-  call returns `EcsError::OutOfMemory`, as documented, and leaves the world without an empty
-  `Events<T>`.
 - `query_iter/query_8_tables` no longer depends on the heap layout (DECISIONS #42): column
   vectors still double, but once a block reaches 4096 bytes its size is rounded up to half a page
   past a page multiple, so the `Velocity` column no longer lands just below `Position` modulo
@@ -28,19 +24,10 @@ A patch release: no change to the public API (DECISIONS #40–#43).
   behind `QueryIter`, `QueryIterMut` and `ViewIter` (table switch, row mask, `fold`) over three
   table sources (shared world, exclusive world, lent columns), and one parallel chunk splitter
   for `par_for_each(_mut)`. The per-row code is the one of #37; no public API change.
-- CI: the MSRV job runs the workspace tests on Rust 1.88 instead of only `cargo check`.
 - CI: the bench gate builds both revisions with `-C llvm-args=-align-loops=64` (DECISIONS #43),
   so that where LLVM places a hot loop no longer decides a measurement
   (`change/mut_write_all` moved between ≈ 83 and ≈ 110 µs for the same source on AMD Zen 4 and
   Intel runners).
-- Docs: the semver note in `docs/architecture.md` §6 reflects the published 1.0.0.
-
-### Added
-
-- Tests: events against a naive two-buffer model (`tests/common/events.rs`): writer and reader
-  systems, readers skipping frames, `World::send_event`, manual updates and outside cursors,
-  on 1 and 4 workers, as a property test and the new fuzz target `events` (60 s per PR,
-  10 minutes nightly); `send_event` without memory in `tests/oom.rs`.
 
 ### Documentation
 
@@ -49,6 +36,29 @@ A patch release: no change to the public API (DECISIONS #40–#43).
   between the `Velocity` loads and the `Position` stores). A current-table iterator without
   `Option` was tried and is ≈ 30 % slower on 8 tables, so it was not kept (#41,
   `docs/architecture.md` §6).
+
+## [1.0.1] - 2026-10-15
+
+A patch release: no change to the public API (DECISIONS #40).
+
+### Fixed
+
+- `World::send_event` for the first event of a type no longer aborts the process when memory
+  runs out: the event's buffer is reserved before the `Events<T>` resource is created, so the
+  call returns `EcsError::OutOfMemory`, as documented, and leaves the world without an empty
+  `Events<T>`.
+
+### Added
+
+- Tests: events against a naive two-buffer model (`tests/common/events.rs`): writer and reader
+  systems, readers skipping frames, `World::send_event`, manual updates and outside cursors,
+  on 1 and 4 workers, as a property test and the new fuzz target `events` (60 s per PR,
+  10 minutes nightly); `send_event` without memory in `tests/oom.rs`.
+
+### Changed
+
+- CI: the MSRV job runs the workspace tests on Rust 1.88 instead of only `cargo check`.
+- Docs: the semver note in `docs/architecture.md` §6 reflects the published 1.0.0.
 
 ## [1.0.0] - 2026-10-15
 
