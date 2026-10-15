@@ -56,6 +56,12 @@ World
   `try_reserve`, so a failure returns `EcsError::OutOfMemory` with the world unchanged (except for
   a possibly created empty table). The move itself does not allocate; `despawn` never allocates.
   Checked by `tests/oom.rs` with a failing global allocator (DECISIONS #11).
+- **Column growth (DECISIONS #42).** The three vectors of a column double like `Vec`, but once
+  a block reaches 4096 bytes its capacity is rounded up so that its size ends half a page past a
+  page multiple. Plain doubling makes every block a page multiple, so blocks reallocated one
+  after another start a few bytes apart modulo 4096, and a column read by a query could sit just
+  below one it writes (4K aliasing, §6). The check is inlined and the growth is out of line, as
+  in `Vec`.
 - **No `unsafe`.** A column is `Vec<T>` behind the crate-private `Column` trait object (DECISIONS
   #9); the trait has the operations a table needs without knowing `T` (an empty clone, reserve,
   `swap_remove` with drop, `swap_remove` into another column of the same type). Iteration (M2)
@@ -336,6 +342,12 @@ tools/bench_gate.py               A/B of PR base and head, normalized by a refer
   distribution is the same; a failure of `query_8_tables` alone is confirmed by sampling more
   processes. A current table without `Option` was ≈ 30 % slower on 8 tables with the same heap
   history and was not kept; the remaining lever is storage (how column `Vec`s are allocated).
+  DECISIONS #42 pulls that lever: column vectors still double, but once a block reaches a page
+  its byte size is rounded up to half a page past a page multiple, so consecutive blocks no
+  longer start a few bytes apart modulo 4096. With the same padding experiment the 8-table loop
+  takes 294–312 µs over 24 processes (before: 456–661 µs), the speed of one table, and the
+  gate measures 428 → 270 µs against `main`; `query_8_tables` is an ordinary gated measurement
+  again.
 - **Semver.** `cargo semver-checks -p pragma_ecs` against the PR base: a breaking change needs a
   version bump (the version is 0.5.0 since M5).
 

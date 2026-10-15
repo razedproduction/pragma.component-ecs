@@ -144,9 +144,9 @@ impl<T: Component> Column for ColumnData<T> {
     }
 
     fn reserve_rows(&mut self, additional: usize) -> Result<(), TryReserveError> {
-        self.values.try_reserve(additional)?;
-        self.added.try_reserve(additional)?;
-        self.changed.try_reserve(additional)
+        reserve_staggered(&mut self.values, additional)?;
+        reserve_staggered(&mut self.added, additional)?;
+        reserve_staggered(&mut self.changed, additional)
     }
 
     fn ticks(&self) -> Ticks<'_> {
@@ -169,6 +169,51 @@ impl<T: Component> Column for ColumnData<T> {
             None => false,
         }
     }
+}
+
+/// The page size whose multiples column blocks avoid (DECISIONS #42).
+const PAGE: usize = 4096;
+
+/// Where in a page a grown column block ends: half a page past a page multiple (DECISIONS #42).
+const STAGGER: usize = PAGE / 2;
+
+/// `Vec::try_reserve` with the same doubling, except that once a block reaches a page its byte
+/// size is rounded up to `STAGGER` past a page multiple (DECISIONS #42).
+///
+/// With plain doubling every block of a column above a page is a page multiple, so blocks
+/// reallocated back to back start a few bytes apart modulo 4096: a column read in a query can
+/// then sit just below a column it writes, and each load of the next rows falsely waits on the
+/// stores just made (4K aliasing). Odd half-page sizes spread the starts over the page.
+#[inline]
+fn reserve_staggered<U>(vec: &mut Vec<U>, additional: usize) -> Result<(), TryReserveError> {
+    if vec.capacity().wrapping_sub(vec.len()) >= additional {
+        return Ok(()); // also every zero-sized `U`: its capacity is `usize::MAX`
+    }
+    grow_staggered(vec, additional)
+}
+
+/// The growth path of [`reserve_staggered`], out of line like `Vec`'s.
+#[cold]
+#[inline(never)]
+fn grow_staggered<U>(vec: &mut Vec<U>, additional: usize) -> Result<(), TryReserveError> {
+    let size = size_of::<U>();
+    let len = vec.len();
+    let Some(needed) = len.checked_add(additional) else {
+        return vec.try_reserve(additional); // the capacity overflow error
+    };
+    // The amortized growth of `Vec`, minimum capacity included.
+    let min = match size {
+        1 => 8,
+        2..=1024 => 4,
+        _ => 1,
+    };
+    let mut rows = needed.max(vec.capacity().saturating_mul(2)).max(min);
+    let bytes = rows.saturating_mul(size);
+    if bytes >= PAGE {
+        let pad = (STAGGER.saturating_add(PAGE).saturating_sub(bytes % PAGE)) % PAGE;
+        rows = rows.saturating_add(pad.div_ceil(size));
+    }
+    vec.try_reserve_exact(rows.saturating_sub(len))
 }
 
 #[cfg(test)]
@@ -208,5 +253,33 @@ mod tests {
         assert!(!src.swap_remove_drop(1));
         assert_eq!(src.values(), [3]);
         assert_eq!(src.len(), 1);
+    }
+
+    #[test]
+    fn grown_blocks_end_half_a_page_past_a_page_multiple() {
+        let mut values: Vec<[f32; 3]> = Vec::new();
+        let mut ticks: Vec<u64> = Vec::new();
+        let mut grows = 0;
+        for _ in 0..100_000 {
+            let before = values.capacity();
+            reserve_staggered(&mut values, 1).unwrap();
+            reserve_staggered(&mut ticks, 1).unwrap();
+            values.push([0.0; 3]);
+            ticks.push(0);
+            if values.capacity() != before {
+                grows += 1;
+                assert!(values.capacity() >= before * 2, "still doubling");
+            }
+            for bytes in [values.capacity() * 12, ticks.capacity() * 8] {
+                assert!(bytes < PAGE || bytes % PAGE >= STAGGER, "{bytes} bytes");
+                assert!(bytes < PAGE || bytes % PAGE < STAGGER + 12, "{bytes} bytes");
+            }
+        }
+        assert!(grows < 20, "amortized: {grows} reallocations");
+
+        let mut empty: Vec<()> = Vec::new();
+        reserve_staggered(&mut empty, usize::MAX).unwrap();
+        assert!(reserve_staggered(&mut ticks, usize::MAX).is_err());
+        assert!(reserve_staggered(&mut ticks, usize::MAX / 4).is_err());
     }
 }

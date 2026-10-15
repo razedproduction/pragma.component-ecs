@@ -11,6 +11,16 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
   table sources (shared world, exclusive world, lent columns), and one parallel chunk splitter
   for `par_for_each(_mut)`. The per-row code is the one of #37; no public API change.
 
+### Fixed
+
+- `query_iter/query_8_tables` no longer depends on the heap layout (DECISIONS #42): column
+  vectors still double, but once a block reaches 4096 bytes its size is rounded up to half a page
+  past a page multiple, so the `Velocity` column no longer lands just below `Position` modulo
+  4096 (4K aliasing). Over 8 paddings × 3 processes: 456–661 µs before, 294–312 µs after, the
+  1-table speed; the bench gate against `main` shows 428 → 270 µs, with spawns level or faster
+  and every other benchmark within ± 3 %. At most 2 KiB more capacity per column vector; no
+  `unsafe`, out-of-memory errors unchanged, no public API change.
+
 ### Documentation
 
 - The 8-table spread of `query_iter/query_8_tables` (#37) is a heap-layout effect, not code
