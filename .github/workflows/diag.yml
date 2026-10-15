@@ -6,6 +6,10 @@ on:
 
 jobs:
   diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -15,37 +19,29 @@ jobs:
       - run: rustup show
       - name: environment
         run: |
-          cat /sys/kernel/mm/transparent_hugepage/enabled || true
-          cat /sys/kernel/mm/transparent_hugepage/defrag || true
-          ldd --version | head -1
           lscpu | grep -E 'Model name|^CPU\(s\)|L1d|L2|L3' || true
+          ldd --version | head -1
       - name: build
         run: |
+          git worktree add --detach ../main origin/main
           git worktree add --detach ../base origin/tmp/lx-base
+          (cd ../main && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../tm cargo bench -p pragma_ecs --bench change --bench query --no-run)
           (cd ../base && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../tb cargo bench -p pragma_ecs --bench change --bench query --no-run)
           CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../th cargo bench -p pragma_ecs --bench change --bench query --no-run
       - name: interleaved runs
         run: |
           exe() { ls "$1"/release/deps/$2-* | grep -v '\.d$' | head -1; }
-          BC=$(exe ../tb change); BQ=$(exe ../tb query)
-          HC=$(exe ../th change); HQ=$(exe ../th query)
-          run() { # label change-exe query-exe offset
-            echo "=== $1"
-            if [ "$4" = "-" ]; then unset PRAGMA_XL_OFF; else export PRAGMA_XL_OFF=$4; fi
-            PRAGMA_XL_DBG=1 "$2" --bench --warm-up-time 1 --measurement-time 3 --noplot 'change/mut' 2>dbg.txt \
-              | grep -E '^change|time:   \[' | grep -v 'change:' || true
-            grep '^XL' dbg.txt | tail -4
-            PRAGMA_XL_DBG=1 "$3" --bench --warm-up-time 1 --measurement-time 3 --noplot 'query_iter/query_(1|8)_tables' 2>dbg.txt \
-              | grep -E '^query_iter|time:   \[' || true
-            grep '^XL' dbg.txt | tail -10
+          run() { # label target-dir offset
+            if [ "$3" = "-" ]; then unset PRAGMA_XL_OFF; else export PRAGMA_XL_OFF=$3; fi
+            "$(exe $2 change)" --bench --warm-up-time 1 --measurement-time 3 --noplot 'change/mut' 2>/dev/null \
+              | grep -E 'time:   \[[0-9]' | awk -v l="$1" '{print "RES", l, NR==1?"mut_read_only":"mut_write_all", $4}'
+            "$(exe $2 query)" --bench --warm-up-time 1 --measurement-time 3 --noplot 'query_iter/(vec|query_8_tables)/' 2>/dev/null \
+              | grep -E 'time:   \[[0-9]' | awk -v l="$1" '{print "RES", l, NR==1?"vec":"query_8_tables", $4}'
             unset PRAGMA_XL_OFF
           }
           for r in 1 2 3; do
-            echo "##### round $r"
-            run "base c209b4d" "$BC" "$BQ" -
-            run "head 2048" "$HC" "$HQ" -
-            run "head plain" "$HC" "$HQ" plain
-            run "head 0" "$HC" "$HQ" 0
-            run "head 1024" "$HC" "$HQ" 1024
-            run "head 3072" "$HC" "$HQ" 3072
+            run "main" ../tm -
+            run "c209b4d" ../tb -
+            run "head" ../th -
+            run "head-plain" ../th plain
           done
