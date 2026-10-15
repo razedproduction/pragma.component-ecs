@@ -10,7 +10,7 @@ use pragma_core::jobs::{Grain, ThreadPool};
 
 use crate::access::{Access, AccessKind};
 use crate::archetype::Archetype;
-use crate::query::{Masked, Masks, Plan, run};
+use crate::query::{Plan, Rows, Tables, run};
 use crate::{
     EcsError, Query, QueryData, QueryFilter, ReadOnlyQueryData, Res, ResMut, Resource, World,
 };
@@ -311,13 +311,9 @@ impl<'w, Q: QueryData, F: QueryFilter> View<'w, '_, Q, F> {
 
     fn rows(&mut self) -> Result<ViewIter<'_, Q, F>, EcsError> {
         self.prepare()?;
+        let (tables, mask) = self.lent();
         Ok(ViewIter {
-            tables: self.world.archetypes(),
-            ids: self.query.matched().iter(),
-            masks: Masks::new(self.query.mask()),
-            cursor: Q::cursor(&mut self.guard),
-            tick: self.ticks.this_run,
-            rows: None,
+            rows: Rows::new(tables, mask),
         })
     }
 
@@ -326,28 +322,22 @@ impl<'w, Q: QueryData, F: QueryFilter> View<'w, '_, Q, F> {
         G: Fn(Q::Item<'a>) + Sync,
     {
         self.prepare()?;
-        let tables: &'a [Archetype] = self.world.archetypes();
-        let matched = self.query.matched();
-        let plan = Plan::new(
-            matched
-                .iter()
-                .filter_map(|&id| tables.get(id))
-                .map(Archetype::len),
-            grain,
-        );
-        let tick = self.ticks.this_run;
-        let mut masks = Masks::<F>::new(self.query.mask());
-        let mut cursor = Q::cursor(&mut self.guard);
-        let rows = matched.iter().filter_map(|&id| {
-            let entities = tables.get(id)?.entities();
-            let mask = masks.take(entities.len());
-            Some((
-                entities.len(),
-                Q::lent(&mut cursor, id, entities, tick)?,
-                mask,
-            ))
-        });
-        run::<Q, G>(rows, plan, self.pool, &f, self.world.len())
+        let plan = Plan::new(self.world.archetypes(), self.query.matched(), grain);
+        let (pool, entities) = (self.pool, self.world.len());
+        let (tables, mask) = self.lent();
+        run::<Q, F, G>(tables, mask, plan, pool, &f, entities)
+    }
+
+    /// The matching tables in the columns lent to the system, and their row mask.
+    fn lent(&mut self) -> (Lent<'_, Q>, &[bool]) {
+        let query: &Query<Q, F> = self.query;
+        let tables = Lent {
+            tables: self.world.archetypes(),
+            ids: query.matched().iter(),
+            cursor: Q::cursor(&mut self.guard),
+            tick: self.ticks.this_run,
+        };
+        (tables, query.mask())
     }
 
     /// Brings the archetype cache up to date and fills the row mask of a row filter from the
@@ -415,36 +405,14 @@ where
 /// # let _ = count;
 /// ```
 pub struct ViewIter<'a, Q: QueryData, F: QueryFilter = ()> {
-    tables: &'a [Archetype],
-    ids: slice::Iter<'a, usize>,
-    /// The row mask of the tables not visited yet.
-    masks: Masks<'a, F>,
-    cursor: Q::Cursor<'a>,
-    /// The change tick a write stamps.
-    tick: u64,
-    /// The rest of the current table.
-    rows: Option<Masked<'a, Q::Iter<'a>>>,
+    rows: Rows<'a, 'a, Q, F, Lent<'a, Q>>,
 }
 
 impl<Q: QueryData, F: QueryFilter> fmt::Debug for ViewIter<'_, Q, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ViewIter")
-            .field("tables_left", &self.ids.len())
+            .field("tables_left", &self.rows.left())
             .finish_non_exhaustive()
-    }
-}
-
-impl<'a, Q: QueryData, F: QueryFilter> ViewIter<'a, Q, F> {
-    /// The rows of the next matching table; `None` when every table was visited.
-    #[inline(always)]
-    fn table(&mut self) -> Option<Option<Masked<'a, Q::Iter<'a>>>> {
-        let &id = self.ids.next()?;
-        let entities = self.tables.get(id)?.entities();
-        let mask = self.masks.take(entities.len());
-        Some(
-            Q::lent(&mut self.cursor, id, entities, self.tick)
-                .map(|rows| Masked::new(Q::iter(rows), mask)),
-        )
     }
 }
 
@@ -453,26 +421,34 @@ impl<'a, Q: QueryData, F: QueryFilter> Iterator for ViewIter<'a, Q, F> {
 
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Some(item) = self.rows.as_mut().and_then(Iterator::next) {
-                return Some(item);
-            }
-            self.rows = self.table()?;
-        }
+        self.rows.next()
     }
 
-    fn fold<B, G: FnMut(B, Self::Item) -> B>(mut self, init: B, mut g: G) -> B {
-        let mut acc = self
-            .rows
-            .take()
-            .into_iter()
-            .fold(init, |acc, rows| rows.fold(acc, &mut g));
-        while let Some(rows) = self.table() {
-            acc = rows
-                .into_iter()
-                .fold(acc, |acc, rows| rows.fold(acc, &mut g));
-        }
-        acc
+    fn fold<B, G: FnMut(B, Self::Item) -> B>(self, init: B, g: G) -> B {
+        self.rows.fold(init, g)
+    }
+}
+
+/// The matching tables in the columns lent to a system (DECISIONS #18).
+struct Lent<'a, Q: QueryData> {
+    tables: &'a [Archetype],
+    ids: slice::Iter<'a, usize>,
+    cursor: Q::Cursor<'a>,
+    /// The change tick a write stamps.
+    tick: u64,
+}
+
+impl<'a, Q: QueryData> Tables<'a, Q> for Lent<'a, Q> {
+    #[inline(always)]
+    fn next_table(&mut self) -> Option<(usize, Option<Q::Slice<'a>>)> {
+        let &id = self.ids.next()?;
+        let entities = self.tables.get(id)?.entities();
+        let rows = Q::lent(&mut self.cursor, id, entities, self.tick);
+        Some((entities.len(), rows))
+    }
+
+    fn left(&self) -> usize {
+        self.ids.len()
     }
 }
 

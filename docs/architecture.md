@@ -56,6 +56,12 @@ World
   `try_reserve`, so a failure returns `EcsError::OutOfMemory` with the world unchanged (except for
   a possibly created empty table). The move itself does not allocate; `despawn` never allocates.
   Checked by `tests/oom.rs` with a failing global allocator (DECISIONS #11).
+- **Column growth (DECISIONS #42).** The three vectors of a column double like `Vec`, but once
+  a block reaches 4096 bytes its capacity is rounded up so that its size ends half a page past a
+  page multiple. Plain doubling makes every block a page multiple, so blocks reallocated one
+  after another start a few bytes apart modulo 4096, and a column read by a query could sit just
+  below one it writes (4K aliasing, §6). The check is inlined and the growth is out of line, as
+  in `Vec`.
 - **No `unsafe`.** A column is `Vec<T>` behind the crate-private `Column` trait object (DECISIONS
   #9); the trait has the operations a table needs without knowing `T` (an empty clone, reserve,
   `swap_remove` with drop, `swap_remove` into another column of the same type). Iteration (M2)
@@ -178,6 +184,11 @@ schedule.run(&mut world, &pool)?;                      // every frame
   ascending order, splitting the `&mut [Vec<T>]` of a written type off table by table, as
   `iter_mut` on the world does (no `unsafe`, DECISIONS #13 unchanged). `par_for_each(_mut)` use
   the same chunks as queries, on the pool the frame runs on.
+- **One iteration path (1.0.x patch, DECISIONS #41).** Queries and views differ only in where a
+  table's rows come from: the tables of a shared world, of an exclusively borrowed world, or the
+  columns lent to the system. Each of the three is a small internal `Tables` source; one generic
+  `Rows` iterator (behind `QueryIter`, `QueryIterMut`, `ViewIter`) does the table switch, the
+  row mask and `fold`, and one `run` does the parallel chunks.
 - **Errors.** A missing resource is `EcsError::MissingResource` before any system runs. A system
   that returns an error or panics stops the systems ordered after it in that frame (pragma.core
   semantics) and is `SystemFailed { system, message, source }` (the `EcsError`, if it was one) or
@@ -317,8 +328,28 @@ tools/bench_gate.py               A/B of PR base and head, normalized by a refer
   table-filter case once per call: one table went from ≈ 307 µs to ≈ 281 µs, but eight tables
   still range from ≈ 382 µs (version 0.5.0) to ≈ 479–512 µs (1.0.0) for the same source, never
   slower than `main`. Moving the table switch out of line made both 2–3× slower and aligning
-  loops did not help; a different iterator shape (no `Option` around the current table, an
-  index-based tuple iterator) is a 1.x follow-up. The gate keeps measuring it.
+  loops did not help.
+  DECISIONS #41 found the cause: **heap layout, not code generation.** The same binary, with
+  the 8-table world built after a padding allocation of 0–7 KB, takes 317–771 µs. In the slow
+  layouts `Velocity` lies 16–48 bytes below `Position` modulo 4096 in most tables, so the
+  loads of the next rows' velocities 4K-alias the `Position` stores just made. A column's three
+  `Vec`s (values, added, changed) double in lockstep; above 512 rows their sizes are multiples
+  of 4096, so blocks reallocated one after another land a few dozen bytes apart modulo 4096,
+  and the `TypeId` order of the columns (which a version bump changes) decides which lies
+  below. One 100 000-row table gets page-aligned blocks and does not alias. Because the bench
+  builds the 8-table world after criterion's own allocations, every process draws a layout
+  (`main`: 392–587 µs over 10 processes), and a best-of-3 gate can flag a change whose
+  distribution is the same; a failure of `query_8_tables` alone is confirmed by sampling more
+  processes. A current table without `Option` was ≈ 30 % slower on 8 tables with the same heap
+  history and was not kept; the remaining lever is storage (how column `Vec`s are allocated).
+  DECISIONS #42 pulls that lever: column vectors still double, but once a block reaches a page
+  its byte size is rounded up to half a page past a page multiple, so consecutive blocks no
+  longer start a few bytes apart modulo 4096. With the same padding experiment the 8-table loop
+  takes 294–312 µs over 24 processes (before: 456–661 µs), the speed of one table, and the
+  gate measures 428 → 270 µs against `main`; `query_8_tables` is an ordinary gated measurement
+  again. Both sides of the gate are built with `-C llvm-args=-align-loops=64` (DECISIONS #43):
+  on AMD Zen 4 and Intel runners the placement of a hot loop alone moved
+  `change/mut_write_all` between ≈ 83 and ≈ 110 µs for the same source.
 - **Semver.** `cargo semver-checks -p pragma_ecs` against the PR base: a breaking change needs a
   version bump (the version is 0.5.0 since M5).
 

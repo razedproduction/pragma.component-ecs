@@ -20,6 +20,9 @@ noise is its own noise: median / minimum − 1 over the runs of each revision, t
 
 A measurement missing on the base revision (a new benchmark) is reported, not gated.
 
+Both revisions are built with `-C llvm-args=-align-loops=64` added to RUSTFLAGS (DECISIONS #43),
+so that code placement does not decide a measurement.
+
 Usage:
   python3 tools/bench_gate.py --base <base worktree> --head <head worktree>
                               [--rounds 3] [--threshold 0.10] [--summary FILE]
@@ -62,6 +65,10 @@ REFERENCES = {
     "change/read_changed_all/100000": "change/read_plain/100000",
     "change/mut_write_all/100000": "change/mut_read_only/100000",
 }
+# Both sides are built with hot loops aligned to 64 bytes (DECISIONS #43): otherwise where a
+# loop lands in the binary decides some measurements on a shared runner (change/mut_write_all
+# 83 vs 110 µs on AMD Zen 4 and Intel for the same source), and any unrelated code change moves it.
+ALIGN_LOOPS = "-C llvm-args=-align-loops=64"
 ECS_SIM_ENTITIES = 100_000
 ECS_SIM_TICKS = 200
 ECS_SIM_RUNS = 3
@@ -76,6 +83,7 @@ class Side:
     def env(self) -> dict[str, str]:
         env = dict(os.environ)
         env["CARGO_TARGET_DIR"] = str(self.target)
+        env["RUSTFLAGS"] = f"{env.get('RUSTFLAGS', '')} {ALIGN_LOOPS}".strip()
         return env
 
 
