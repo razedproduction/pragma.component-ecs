@@ -1,0 +1,54 @@
+# TEMP: Linux diagnostics for commands/spawn_bundle_commands thread placement (PR #11). Never merged.
+name: linux-diag-placement
+
+on:
+  pull_request:
+
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup show
+      - name: environment
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Thread\(s\) per core' || true
+          lscpu -e || true
+          for c in /sys/devices/system/cpu/cpu[0-9]*; do echo "$c siblings $(cat $c/topology/thread_siblings_list)"; done
+      - name: build
+        run: |
+          git worktree add --detach ../rel origin/release-1.0.1
+          (cd ../rel && RUSTFLAGS="-C llvm-args=-align-loops=64" CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t cargo bench -p pragma_ecs --bench commands --no-run)
+      - name: placement runs
+        run: |
+          export MALLOC_ARENA_MAX=1
+          EXE=$(ls ../t/release/deps/commands-* | grep -v '\.d$' | head -1)
+          SIB=$(cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list)
+          SAME=$(echo "$SIB" | tr ',-' '  ' | awk '{for(i=1;i<=NF;i++) if ($i!=0) {print $i; exit}}')
+          N=$(nproc)
+          DIFF=""
+          for c in $(seq 1 $((N-1))); do
+            case ",$(echo $SIB | tr '-' ','),"  in *",$c,"*) ;; *) DIFF=$c; break ;; esac
+          done
+          echo "cpu0 siblings=$SIB same=$SAME diff=$DIFF"
+          for r in 1 2 3 4 5 6; do
+            for v in all one same diff; do
+              case $v in
+                all) pin="" ;;
+                one) pin="taskset -c 0" ;;
+                same) [ -n "$SAME" ] || continue; pin="taskset -c 0,$SAME" ;;
+                diff) [ -n "$DIFF" ] || continue; pin="taskset -c 0,$DIFF" ;;
+              esac
+              for b in spawn_bundle_commands spawn_commands spawn_bundle_direct; do
+                $pin "$EXE" --bench --warm-up-time 1 --measurement-time 3 --noplot "^commands/$b/10000\$" 2>/dev/null \
+                  | awk -v l="$v" -v b="$b" '/time:   \[[0-9]/{print "RES", l, b, $4, $5}'
+              done
+            done
+          done
