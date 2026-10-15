@@ -21,7 +21,7 @@ jobs:
           lscpu | grep -E 'Model name|^CPU\(s\)|L1d|L2|L3' || true
       - name: build
         run: |
-          git worktree add --detach ../base "${{ github.event.pull_request.base.sha }}"
+          git worktree add --detach ../base origin/tmp/lx-base
           (cd ../base && CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../tb cargo bench -p pragma_ecs --bench change --bench query --no-run)
           CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../th cargo bench -p pragma_ecs --bench change --bench query --no-run
       - name: interleaved runs
