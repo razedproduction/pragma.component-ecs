@@ -4,6 +4,21 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ## [Unreleased]
 
+### Changed
+
+- `Query` and `View` share one iteration path (DECISIONS #41): one internal sequential iterator
+  behind `QueryIter`, `QueryIterMut` and `ViewIter` (table switch, row mask, `fold`) over three
+  table sources (shared world, exclusive world, lent columns), and one parallel chunk splitter
+  for `par_for_each(_mut)`. The per-row code is the one of #37; no public API change.
+
+### Documentation
+
+- The 8-table spread of `query_iter/query_8_tables` (#37) is a heap-layout effect, not code
+  generation: the same binary takes 317–771 µs depending on where the columns land (4K aliasing
+  between the `Velocity` loads and the `Position` stores). A current-table iterator without
+  `Option` was tried and is ≈ 30 % slower on 8 tables, so it was not kept (#41,
+  `docs/architecture.md` §6).
+
 ## [1.0.0] - 2026-10-15
 
 The first crates.io release (M6, DECISIONS #39): everything since 0.1.0, milestones M2–M6
