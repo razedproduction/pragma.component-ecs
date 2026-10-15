@@ -352,7 +352,10 @@ tools/bench_gate.py               A/B of PR base and head, normalized by a refer
   gate measures 428 → 270 µs against `main`; `query_8_tables` is an ordinary gated measurement
   again. Both sides of the gate are built with `-C llvm-args=-align-loops=64` (DECISIONS #43):
   on AMD Zen 4 and Intel runners the placement of a hot loop alone moved
-  `change/mut_write_all` between ≈ 83 and ≈ 110 µs for the same source.
+  `change/mut_write_all` between ≈ 83 and ≈ 110 µs for the same source. Each measurement runs in
+  a process of its own, on Linux with `MALLOC_ARENA_MAX=1` (DECISIONS #44): glibc's per-thread
+  arenas and the heap left by earlier benchmarks flipped `commands/spawn_commands` between
+  ≈ 1.5 and ≈ 2.0 ms per process.
 - **Semver.** `cargo semver-checks -p pragma_ecs` against the PR base: a breaking change needs a
   version bump. Since 1.0.0 is published, that means 2.0.0; 1.x patches only fix and minor
   releases only add.

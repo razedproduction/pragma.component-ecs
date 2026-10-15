@@ -6,7 +6,7 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ## [1.0.2] - 2026-10-16
 
-A patch release: no change to the public API (DECISIONS #41–#43).
+A patch release: no change to the public API (DECISIONS #41–#44).
 
 ### Fixed
 
@@ -28,6 +28,9 @@ A patch release: no change to the public API (DECISIONS #41–#43).
   so that where LLVM places a hot loop no longer decides a measurement
   (`change/mut_write_all` moved between ≈ 83 and ≈ 110 µs for the same source on AMD Zen 4 and
   Intel runners).
+- CI: the bench gate runs each measurement in its own process and, on Linux, with
+  `MALLOC_ARENA_MAX=1` (DECISIONS #44), so that glibc allocator state no longer flips
+  `commands/spawn_commands` between ≈ 1.5 and ≈ 2.0 ms per process.
 
 ### Documentation
 

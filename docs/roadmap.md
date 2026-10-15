@@ -132,6 +132,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] Staggered column growth: the 8-table loop no longer depends on the heap layout,
   ≈ 428 → 270 µs in the bench gate (DECISIONS #42)
 - [x] Bench gate: both sides built with aligned loops (DECISIONS #43)
+- [x] Bench gate: one process per measurement, one malloc arena on Linux (DECISIONS #44)
 - [ ] Release: the tag `v1.0.2` and `cargo publish` (the owner)
 
 ---
