@@ -144,9 +144,12 @@ impl<T: Component> Column for ColumnData<T> {
     }
 
     fn reserve_rows(&mut self, additional: usize) -> Result<(), TryReserveError> {
+        let before = self.values.capacity();
         reserve_staggered(&mut self.values, additional)?;
         reserve_staggered(&mut self.added, additional)?;
-        reserve_staggered(&mut self.changed, additional)
+        reserve_staggered(&mut self.changed, additional)?;
+        xl_dbg(self, before);
+        Ok(())
     }
 
     fn ticks(&self) -> Ticks<'_> {
@@ -201,6 +204,12 @@ fn grow_staggered<U>(vec: &mut Vec<U>, additional: usize) -> Result<(), TryReser
     let Some(needed) = len.checked_add(additional) else {
         return vec.try_reserve(additional); // the capacity overflow error
     };
+    // TEMP diagnostics: PRAGMA_XL_OFF=plain -> Vec growth; =<n> -> end blocks n bytes past a page.
+    let off = match std::env::var("PRAGMA_XL_OFF").ok().as_deref() {
+        Some("plain") => return vec.try_reserve(additional),
+        Some(n) => n.parse().unwrap_or(STAGGER),
+        None => STAGGER,
+    };
     // The amortized growth of `Vec`, minimum capacity included.
     let min = match size {
         1 => 8,
@@ -210,10 +219,36 @@ fn grow_staggered<U>(vec: &mut Vec<U>, additional: usize) -> Result<(), TryReser
     let mut rows = needed.max(vec.capacity().saturating_mul(2)).max(min);
     let bytes = rows.saturating_mul(size);
     if bytes >= PAGE {
-        let pad = (STAGGER.saturating_add(PAGE).saturating_sub(bytes % PAGE)) % PAGE;
+        let pad = (off.saturating_add(PAGE).saturating_sub(bytes % PAGE)) % PAGE;
         rows = rows.saturating_add(pad.div_ceil(size));
     }
     vec.try_reserve_exact(rows.saturating_sub(len))
+}
+
+// TEMP diagnostics for the Linux runner (never merged).
+fn xl_dbg<T>(c: &ColumnData<T>, before: usize) {
+    if c.values.capacity() == before
+        || c.values.capacity() < 16_384
+        || std::env::var_os("PRAGMA_XL_DBG").is_none()
+    {
+        return;
+    }
+    let v = c.values.as_ptr() as usize;
+    let a = c.added.as_ptr() as usize;
+    let ch = c.changed.as_ptr() as usize;
+    eprintln!(
+        "XL {} vcap={} vbytes={} ccap={} v%4K={} a%4K={} c%4K={} (c-v)%4K={} v%2M={} c%2M={}",
+        std::any::type_name::<T>(),
+        c.values.capacity(),
+        c.values.capacity() * size_of::<T>(),
+        c.changed.capacity(),
+        v % 4096,
+        a % 4096,
+        ch % 4096,
+        ch.wrapping_sub(v) % 4096,
+        v % (1 << 21),
+        ch % (1 << 21),
+    );
 }
 
 #[cfg(test)]
