@@ -127,6 +127,9 @@ impl World {
     /// Sends `event` to the [`Events<T>`] resource, creating it if the world has none. Readers
     /// see it from the next frame on (DECISIONS #26).
     ///
+    /// The first event of a type reserves its buffer before the resource is created, which then
+    /// allocates one box, as [`insert_resource`](Self::insert_resource) does (DECISIONS #20, #40).
+    ///
     /// ```
     /// use pragma_ecs::{EventCursor, Events, World};
     ///
@@ -142,15 +145,16 @@ impl World {
     ///
     /// # Errors
     ///
-    /// [`EcsError::OutOfMemory`] if the event buffer cannot grow; the event is dropped.
+    /// [`EcsError::OutOfMemory`] if the event buffer cannot grow; the event is dropped and the
+    /// world is unchanged (no empty [`Events<T>`] is left behind).
     pub fn send_event<T: Event>(&mut self, event: T) -> Result<(), EcsError> {
-        if !self.resources.contains::<Events<T>>() {
-            self.resources.insert(Events::<T>::default());
+        if let Some(events) = self.resources.get_mut::<Events<T>>() {
+            return events.send(event);
         }
-        match self.resources.get_mut::<Events<T>>() {
-            Some(events) => events.send(event),
-            None => Ok(()),
-        }
+        let mut events = Events::new();
+        events.send(event)?;
+        self.resources.insert(events);
+        Ok(())
     }
 
     /// Takes a new change tick for one mutating operation.
