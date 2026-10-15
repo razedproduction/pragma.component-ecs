@@ -14,7 +14,9 @@ A regression is computed as follows:
                operations, a plain read in the same bench): the change does not affect it, so
                its shift is runner noise;
   normalized = ratio / ref_ratio.
-A measurement with a reference fails if ratio > 1 + threshold AND normalized > 1 + threshold.
+A measurement with a reference fails if ratio > limit AND normalized > limit, where
+limit = 1 + threshold + spread and spread is the measurement's own process-to-process spread
+(max / min − 1 over the rounds of each revision, the larger of the two; DECISIONS #44).
 A measurement without a reference (ecs_sim ms/tick) fails if ratio > 1 + threshold + noise, where
 noise is its own noise: median / minimum − 1 over the runs of each revision, the larger of the two.
 
@@ -191,6 +193,12 @@ def spread(values: list[float]) -> float:
     return ordered[len(ordered) // 2] / ordered[0] - 1.0
 
 
+def process_spread(rounds: list[dict[str, float]], key: str) -> float:
+    """How far one revision's runs of `key` (one process each) lie apart: max / min − 1 (DECISIONS #44)."""
+    values = [r[key] for r in rounds if key in r]
+    return max(values) / min(values) - 1.0 if values else 0.0
+
+
 def best(rounds: list[dict[str, float]]) -> dict[str, float]:
     merged: dict[str, float] = {}
     for result in rounds:
@@ -255,8 +263,12 @@ def main() -> int:
         ref = REFERENCES.get(key)
         if ref in ref_ratios:
             normalized = ratio / ref_ratios[ref]
-            failed = ratio > limit and normalized > limit
-            note = f"{ref_ratios[ref]:.3f} ({ref.split('/', 2)[1]})"
+            # A measurement that lands in a different mode per process (DECISIONS #44) cannot be
+            # gated tighter than its own process-to-process spread.
+            spread_k = max(process_spread(rounds["base"], key), process_spread(rounds["head"], key))
+            key_limit = limit + spread_k
+            failed = ratio > key_limit and normalized > key_limit
+            note = f"{ref_ratios[ref]:.3f} ({ref.split('/', 2)[1]}); limit {key_limit:.3f}"
         else:
             normalized = ratio
             key_noise = own_noise.get(key, noise)

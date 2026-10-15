@@ -30,7 +30,9 @@ A patch release: no change to the public API (DECISIONS #41–#44).
   Intel runners).
 - CI: the bench gate runs each measurement in its own process and, on Linux, with
   `MALLOC_ARENA_MAX=1` (DECISIONS #44), so that glibc allocator state no longer flips
-  `commands/spawn_commands` between ≈ 1.5 and ≈ 2.0 ms per process.
+  `commands/spawn_commands` between ≈ 1.5 and ≈ 2.0 ms per process; each measurement's limit
+  also includes its own process-to-process spread, since bundle spawning still lands in one of
+  two modes per process.
 
 ### Documentation
 
