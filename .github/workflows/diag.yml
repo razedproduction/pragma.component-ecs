@@ -1,0 +1,51 @@
+# TEMP: Linux diagnostics for commands/spawn_commands (PR #11). Never merged.
+name: linux-diag-spawn
+
+on:
+  pull_request:
+
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: rustup show
+      - name: environment
+        run: lscpu | grep -E 'Model name' || true
+      - name: build
+        run: |
+          L="-C llvm-args=-align-loops=64"
+          F="-C llvm-args=-align-all-functions=6"
+          B="-C llvm-args=-align-all-nofallthru-blocks=6"
+          for side in main:origin/main rel:origin/release-1.0.1; do
+            name=${side%%:*}; rev=${side#*:}
+            git worktree add --detach ../$name $rev
+            for v in none loops funcs blocks; do
+              case $v in
+                none) flags="" ;;
+                loops) flags="$L" ;;
+                funcs) flags="$L $F" ;;
+                blocks) flags="$L $F $B" ;;
+              esac
+              (cd ../$name && RUSTFLAGS="$flags" CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t-$name-$v cargo bench -p pragma_ecs --bench commands --no-run)
+            done
+          done
+      - name: interleaved runs
+        run: |
+          exe() { ls "$1"/release/deps/commands-* | grep -v '\.d$' | head -1; }
+          for r in 1 2 3; do
+            for v in none loops funcs blocks; do
+              for name in main rel; do
+                d=../t-$name-$v
+                "$(exe $d)" --bench --warm-up-time 1 --measurement-time 3 --noplot 'commands/spawn' 2>/dev/null \
+                  | awk -v l="$name-$v" '/^commands\//{b=$1} /time:   \[[0-9]/{print "RES", l, b, $4, $5}'
+              done
+            done
+          done
