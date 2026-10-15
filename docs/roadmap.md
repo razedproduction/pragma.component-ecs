@@ -10,11 +10,11 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 |---|---|---|---|
 | M0 | 0.0.1 | Repository foundation | ✅ |
 | M1 | 0.1.0 | Entities and component storage | ✅ |
-| M2 | 0.2.0 | Queries | 🚧 |
-| M3 | 0.3.0 | Systems on the pragma.core frame graph, vertical slice | 🚧 |
-| M4 | 0.4.0 | Commands, events, change detection | 🚧 |
-| M5 | 0.5.0 | Hardening: determinism, fuzz, benches, semver | 🚧 |
-| M6 | 1.0.0 | Stable API, publication | 🚧 |
+| M2 | 0.2.0 | Queries | ✅ (released in 1.0.0) |
+| M3 | 0.3.0 | Systems on the pragma.core frame graph, vertical slice | ✅ (released in 1.0.0) |
+| M4 | 0.4.0 | Commands, events, change detection | ✅ (released in 1.0.0) |
+| M5 | 0.5.0 | Hardening: determinism, fuzz, benches, semver | ✅ (released in 1.0.0) |
+| M6 | 1.0.0 | Stable API, publication | ✅ |
 
 ---
 
@@ -36,7 +36,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] Bounded allocations: growth via `try_reserve` → `EcsError::OutOfMemory` (`tests/oom.rs`, DECISIONS #11)
 - [x] Property tests against a naive `HashMap<Entity, components>` oracle (`tests/oracle.rs`)
 
-## M2 — Queries (0.2.0) 🚧
+## M2 — Queries (0.2.0) ✅
 
 - [x] **Decisions:** `Query<Q, F>` with an archetype cache (DECISIONS #12), column borrows without
   `unsafe` (#13), declared access (#14), chunks of rows for parallel iteration (#15), `criterion` (#16)
@@ -48,7 +48,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] Iteration benchmark (`criterion`, `benches/query.rs`)
 - [x] Property tests of queries against the oracle (`tests/oracle.rs`)
 
-## M3 — Systems and the vertical slice (0.3.0) 🚧
+## M3 — Systems and the vertical slice (0.3.0) ✅
 
 - [x] **Decisions:** function systems with sealed parameters (DECISIONS #17), columns lent to the
   frame graph without `unsafe` (#18), strict ordering plus an `ordered()` mode (#19), resources in
@@ -63,7 +63,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] Property tests of schedules: random system sets build iff no unordered conflict, a frame
   equals a sequential run (`tests/schedule.rs`); frame benchmark (`benches/schedule.rs`)
 
-## M4 — Commands, events, change detection (0.4.0) 🚧
+## M4 — Commands, events, change detection (0.4.0) ✅
 
 - [x] **Decisions:** deferred commands with ids allocated at the sync point (DECISIONS #23), one
   sync point at the end of `Schedule::run` in registration order (#24), lenient command failures
@@ -82,7 +82,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] Benchmarks: command application (`benches/commands.rs`), change-detection overhead
   (`benches/change.rs`)
 
-## M5 — Hardening (0.5.0) 🚧
+## M5 — Hardening (0.5.0) ✅
 
 - [x] **Decisions:** a determinism suite with committed golden hashes (DECISIONS #29), cargo-fuzz
   in a separate workspace over the shared oracles (#30), a separate `baseline/` workspace with
@@ -97,7 +97,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
   (`tools/bench_gate.py`, PRs on Windows and Linux)
 - [x] `cargo-semver-checks` in CI (PRs, baseline `main`)
 
-## M6 — 1.0 (1.0.0) 🚧
+## M6 — 1.0 (1.0.0) ✅
 
 - [x] **Decisions:** an additive sealed `Bundle` for tuples (DECISIONS #35), the API review —
   no renames, hidden items outside semver, `pub use pragma_core` (#36), the sequential query
@@ -111,7 +111,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
   oracles, fuzzed, benchmarked; `ecs_sim` spawns through bundles with unchanged golden hashes
 - [x] crates.io metadata: version 1.0.0, `publish` enabled, the crate's own README and LICENSE,
   `cargo package -p pragma_ecs` verified
-- [ ] Publication on crates.io and the tag (by the owner)
+- [x] Publication on crates.io (`pragma_ecs` 1.0.0) and the tag `v1.0.0`, 2026-10-15
 
 ---
 
