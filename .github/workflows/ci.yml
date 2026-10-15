@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [world_ops, commands, change_ticks]
+        target: [world_ops, commands, change_ticks, events]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

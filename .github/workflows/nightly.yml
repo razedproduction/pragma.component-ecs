@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [world_ops, commands, change_ticks]
+        target: [world_ops, commands, change_ticks, events]
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
