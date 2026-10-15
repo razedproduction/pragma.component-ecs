@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [world_ops, commands, change_ticks]
+        target: [world_ops, commands, change_ticks, events]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,7 +107,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.88 --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +1.88 check --workspace --all-features
+      # Tests and doctests too, not only the library: they build the dev-dependencies and use
+      # more of the language (DECISIONS #40).
+      - run: cargo +1.88 test --workspace --all-features
 
   deny:
     name: cargo-deny
@@ -159,8 +161,9 @@ jobs:
           tool: cargo-semver-checks
       # The baseline is main, not a tag (DECISIONS #33): a breaking public API change without a
       # version bump fails the PR. The package is named: `--workspace` would also pick the
-      # unpublished example, and skipped `pragma_ecs` itself while it was `publish = false` (before 1.0). A short target directory: semver-checks nests the baseline's
-      # build several levels deep (`target/semver-checks/git-<sha>/local-…/target/debug/build/…`),
+      # unpublished example, and skipped `pragma_ecs` itself while it was `publish = false`
+      # (before 1.0). A short target directory: semver-checks nests the baseline's build
+      # several levels deep (`target/semver-checks/git-<sha>/local-…/target/debug/build/…`),
       # which exceeds MAX_PATH on Windows (LNK1104).
       - run: cargo semver-checks -p pragma_ecs --baseline-rev ${{ github.event.pull_request.base.sha }}
         env:

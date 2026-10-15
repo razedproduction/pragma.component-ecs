@@ -4,15 +4,16 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
 
 ## [Unreleased]
 
-### Changed
+## [1.0.1] - 2026-10-15
 
-- `Query` and `View` share one iteration path (DECISIONS #41): one internal sequential iterator
-  behind `QueryIter`, `QueryIterMut` and `ViewIter` (table switch, row mask, `fold`) over three
-  table sources (shared world, exclusive world, lent columns), and one parallel chunk splitter
-  for `par_for_each(_mut)`. The per-row code is the one of #37; no public API change.
+A patch release: no change to the public API (DECISIONS #40–#43).
 
 ### Fixed
 
+- `World::send_event` for the first event of a type no longer aborts the process when memory
+  runs out: the event's buffer is reserved before the `Events<T>` resource is created, so the
+  call returns `EcsError::OutOfMemory`, as documented, and leaves the world without an empty
+  `Events<T>`.
 - `query_iter/query_8_tables` no longer depends on the heap layout (DECISIONS #42): column
   vectors still double, but once a block reaches 4096 bytes its size is rounded up to half a page
   past a page multiple, so the `Velocity` column no longer lands just below `Position` modulo
@@ -20,6 +21,26 @@ The format is [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioni
   1-table speed; the bench gate against `main` shows 428 → 270 µs, with spawns level or faster
   and every other benchmark within ± 3 %. At most 2 KiB more capacity per column vector; no
   `unsafe`, out-of-memory errors unchanged, no public API change.
+
+### Changed
+
+- `Query` and `View` share one iteration path (DECISIONS #41): one internal sequential iterator
+  behind `QueryIter`, `QueryIterMut` and `ViewIter` (table switch, row mask, `fold`) over three
+  table sources (shared world, exclusive world, lent columns), and one parallel chunk splitter
+  for `par_for_each(_mut)`. The per-row code is the one of #37; no public API change.
+- CI: the MSRV job runs the workspace tests on Rust 1.88 instead of only `cargo check`.
+- CI: the bench gate builds both revisions with `-C llvm-args=-align-loops=64` (DECISIONS #43),
+  so that where LLVM places a hot loop no longer decides a measurement
+  (`change/mut_write_all` moved between ≈ 83 and ≈ 110 µs for the same source on AMD Zen 4 and
+  Intel runners).
+- Docs: the semver note in `docs/architecture.md` §6 reflects the published 1.0.0.
+
+### Added
+
+- Tests: events against a naive two-buffer model (`tests/common/events.rs`): writer and reader
+  systems, readers skipping frames, `World::send_event`, manual updates and outside cursors,
+  on 1 and 4 workers, as a property test and the new fuzz target `events` (60 s per PR,
+  10 minutes nightly); `send_event` without memory in `tests/oom.rs`.
 
 ### Documentation
 

@@ -18,4 +18,5 @@
 pub mod bytes;
 pub mod change;
 pub mod commands;
+pub mod events;
 pub mod world;

@@ -1,4 +1,9 @@
 //! Events published at the sync point (DECISIONS #24, #26).
+//!
+//! The property test runs random writer and reader systems (readers skipping frames) together
+//! with sends, manual updates and reads from outside the schedule, and checks every read and the
+//! kept events against a naive model of the two buffers, on 1 and 4 workers. The oracle
+//! (`common/events.rs`) is shared with the `events` fuzz target (DECISIONS #30, #40).
 // Test code: a panic is a test failure.
 #![allow(
     clippy::unwrap_used,
@@ -8,10 +13,50 @@
     clippy::needless_pass_by_value
 )]
 
+mod common;
+
+use common::events::{Case, Step, check, decode};
 use pragma_core::prelude::{PoolConfig, ThreadPool};
 use pragma_ecs::{
     EcsError, EventCursor, EventReader, EventWriter, Events, Res, ResMut, Schedule, World,
 };
+use proptest::prelude::*;
+
+fn step() -> impl Strategy<Value = Step> {
+    prop_oneof![
+        3 => Just(Step::Frame),
+        1 => any::<u32>().prop_map(Step::Send),
+        1 => Just(Step::Update),
+        1 => Just(Step::Read),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Invariant: every reader, inside or outside systems, reads exactly the kept events it has
+    /// not read yet, in sending order, and the world keeps exactly the events of the last two
+    /// updates, on 1 and 4 workers.
+    #[test]
+    fn events_match_a_two_buffer_model(
+        writers in proptest::collection::vec(
+            proptest::collection::vec(proptest::collection::vec(any::<u32>(), 0..4), 1..4),
+            0..4,
+        ),
+        readers in proptest::collection::vec(proptest::collection::vec(any::<bool>(), 1..5), 0..4),
+        steps in proptest::collection::vec(step(), 0..64),
+    ) {
+        check(&Case { writers, readers, steps });
+    }
+
+    /// The fuzz target's decoder: arbitrary bytes are a valid case.
+    #[test]
+    fn decoded_bytes_match_the_two_buffer_model(data in proptest::collection::vec(any::<u8>(), 0..512)) {
+        check(&decode(&data));
+    }
+}
+
+// Behaviour of single schedules.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Ping(u32);

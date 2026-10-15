@@ -15,6 +15,7 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 | M4 | 0.4.0 | Commands, events, change detection | ✅ (released in 1.0.0) |
 | M5 | 0.5.0 | Hardening: determinism, fuzz, benches, semver | ✅ (released in 1.0.0) |
 | M6 | 1.0.0 | Stable API, publication | ✅ |
+| — | 1.0.1 | Patch: `send_event` without memory, events oracle and fuzzing, MSRV tests, one query iteration path, staggered column growth | 🚧 |
 
 ---
 
@@ -112,6 +113,21 @@ Legend: ✅ done · 🚧 in progress · 📋 planned
 - [x] crates.io metadata: version 1.0.0, `publish` enabled, the crate's own README and LICENSE,
   `cargo package -p pragma_ecs` verified
 - [x] Publication on crates.io (`pragma_ecs` 1.0.0) and the tag `v1.0.0`, 2026-10-15
+
+## 1.0.1 — patch 🚧
+
+- [x] **Decision:** `World::send_event` reserves the first event before creating the resource,
+  events get an oracle and a fuzz target, the MSRV job runs the tests (DECISIONS #40)
+- [x] `World::send_event` without memory returns `EcsError::OutOfMemory` and leaves the world
+  unchanged instead of aborting (`tests/oom.rs`)
+- [x] Events against a two-buffer model (`tests/common/events.rs`): proptest and the `events`
+  fuzz target
+- [x] CI: the MSRV job runs `cargo test` on 1.88, not only `cargo check`
+- [x] Queries and views share one iteration path (DECISIONS #41)
+- [x] Staggered column growth: the 8-table loop no longer depends on the heap layout,
+  ≈ 428 → 270 µs in the bench gate (DECISIONS #42)
+- [x] Bench gate: both sides built with aligned loops (DECISIONS #43)
+- [ ] Release: the tag `v1.0.1` and `cargo publish` (the owner)
 
 ---
 
