@@ -26,29 +26,18 @@ jobs:
         run: |
           git worktree add --detach ../rel origin/release-1.0.1
           (cd ../rel && RUSTFLAGS="-C llvm-args=-align-loops=64" CARGO_TARGET_DIR=$GITHUB_WORKSPACE/../t cargo bench -p pragma_ecs --bench commands --no-run)
-      - name: placement runs
+      - name: aslr runs
         run: |
           export MALLOC_ARENA_MAX=1
           EXE=$(ls ../t/release/deps/commands-* | grep -v '\.d$' | head -1)
-          SIB=$(cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list)
-          SAME=$(echo "$SIB" | tr ',-' '  ' | awk '{for(i=1;i<=NF;i++) if ($i!=0) {print $i; exit}}')
-          N=$(nproc)
-          DIFF=""
-          for c in $(seq 1 $((N-1))); do
-            case ",$(echo $SIB | tr '-' ','),"  in *",$c,"*) ;; *) DIFF=$c; break ;; esac
-          done
-          echo "cpu0 siblings=$SIB same=$SAME diff=$DIFF"
-          for r in 1 2 3 4 5 6; do
-            for v in all one same diff; do
-              case $v in
-                all) pin="" ;;
-                one) pin="taskset -c 0" ;;
-                same) [ -n "$SAME" ] || continue; pin="taskset -c 0,$SAME" ;;
-                diff) [ -n "$DIFF" ] || continue; pin="taskset -c 0,$DIFF" ;;
-              esac
-              for b in spawn_bundle_commands spawn_commands spawn_bundle_direct; do
-                $pin "$EXE" --bench --warm-up-time 1 --measurement-time 3 --noplot "^commands/$b/10000\$" 2>/dev/null \
-                  | awk -v l="$v" -v b="$b" '/time:   \[[0-9]/{print "RES", l, b, $4, $5}'
-              done
-            done
+          A=$(uname -m)
+          one() { # label prefix...
+            l=$1; shift
+            "$@" "$EXE" --bench --warm-up-time 1 --measurement-time 2 --noplot '^commands/spawn_bundle_direct/10000$' 2>/dev/null \
+              | awk -v l="$l" '/time:   \[[0-9]/{print "RES", l, "spawn_bundle_direct", $4, $5}'
+          }
+          for r in 1 2 3 4 5 6; do one aslr-on env; one aslr-off setarch $A -R; done
+          for pad in 0 256 512 768 1024 1280 1536 1792 2048 2304 2560 2816 3072 3328 3584 3840; do
+            P=$(head -c $pad /dev/zero | tr '\0' 'x')
+            for r in 1 2; do one "pad$pad" env PAD="$P" setarch $A -R; done
           done
